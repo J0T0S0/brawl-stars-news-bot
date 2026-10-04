@@ -4,33 +4,58 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+  # Re-run immediately whenever the bot or this workflow changes.
+  push:
+    branches: [main]
+    paths:
+      - bot.py
+      - tests/**
+      - .github/workflows/news.yml
+
   workflow_dispatch:
 
 permissions:
   contents: write
 
-jobs:
-  check-news:
+# Never run two instances at once (avoids duplicate posts and push races).
+concurrency:
+  group: brawl-stars-news-bot
+  cancel-in-progress: false
 
+jobs:
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  check-news:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.x"
+          python-version: "3.13"
 
       - name: Run Brawl Stars news bot
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          python bot.py
+        run: python bot.py
 
+      # Runs even if one source failed, so already-sent posts are persisted.
       - name: Save state
+        if: always()
         run: |
           git config user.name "Brawl Stars News Bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -39,7 +64,18 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No state changes."
-          else
-            git commit -m "Update news state"
-            git push
+            exit 0
           fi
+
+          git commit -m "Update news state [skip ci]"
+
+          for attempt in 1 2 3; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push failed (attempt $attempt), rebasing..."
+            git pull --rebase -X theirs
+          done
+
+          echo "::error::Could not push state.json"
+          exit 1
