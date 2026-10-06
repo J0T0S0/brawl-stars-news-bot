@@ -82,6 +82,28 @@ class ParsingTests(unittest.TestCase):
         self.assertLessEqual(len(bot.shorten("word " * 200)), 350)
 
 
+class FallbackTests(unittest.TestCase):
+
+    def test_youtube_falls_back_to_playlist_feed(self):
+        def fake_get(url):
+            if "channel_id" in url:
+                raise OSError("404")
+            return FEED
+
+        with mock.patch.object(bot, "get", side_effect=fake_get),                 mock.patch.object(bot.time, "sleep"):
+            self.assertEqual(len(bot.get_youtube()), 2)
+
+    def test_all_feeds_down_is_source_unavailable(self):
+        with mock.patch.object(bot, "get", side_effect=OSError("404")),                 mock.patch.object(bot.time, "sleep"):
+            with self.assertRaises(bot.SourceUnavailable):
+                bot.get_youtube()
+
+    def test_unavailable_source_does_not_fail_job(self):
+        with mock.patch.dict(os.environ, {"DISCORD_WEBHOOK_URL": "https://w"}),                 mock.patch.object(bot, "load_state", return_value={}),                 mock.patch.object(bot, "process_news",
+                                  side_effect=bot.SourceUnavailable("x")),                 mock.patch.object(bot, "process_youtube", return_value=0):
+            bot.main()  # must not raise SystemExit
+
+
 class StateTests(unittest.TestCase):
 
     def setUp(self):

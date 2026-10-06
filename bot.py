@@ -17,6 +17,14 @@ YOUTUBE_FEED_URL = (
     f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
 )
 
+# YouTube's channel feed intermittently returns 404; the uploads playlist
+# feed (UC... -> UU...) serves the same videos and is used as a fallback.
+YOUTUBE_FEED_URLS = (
+    YOUTUBE_FEED_URL,
+    "https://www.youtube.com/feeds/videos.xml?playlist_id=UU"
+    + YOUTUBE_CHANNEL_ID[2:],
+)
+
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 MAX_HISTORY = 200
@@ -43,6 +51,10 @@ LABELS = {
     "balance": "Balance / update news",
     "news": "Official news",
 }
+
+
+class SourceUnavailable(Exception):
+    """A source could not be fetched (transient; retried next run)."""
 
 
 def log(message):
@@ -256,7 +268,10 @@ def absolute_url(url):
 
 
 def get_news():
-    page = get(NEWS_URL).decode("utf-8", errors="ignore")
+    try:
+        page = get(NEWS_URL).decode("utf-8", errors="ignore")
+    except OSError as error:
+        raise SourceUnavailable(f"{NEWS_URL}: {error}")
 
     parser = LinkParser()
     parser.feed(page)
@@ -319,8 +334,22 @@ def get_article_meta(url):
 # YOUTUBE
 # ------------------------------------------------------------
 
+def fetch_youtube_feed():
+    errors = []
+
+    for url in YOUTUBE_FEED_URLS:
+        for attempt in range(2):
+            try:
+                return ET.fromstring(get(url))
+            except (OSError, ET.ParseError) as error:
+                errors.append(f"{url}: {error}")
+                time.sleep(2)
+
+    raise SourceUnavailable("; ".join(errors))
+
+
 def get_youtube():
-    root = ET.fromstring(get(YOUTUBE_FEED_URL))
+    root = fetch_youtube_feed()
 
     ns = {
         "atom": "http://www.w3.org/2005/Atom",
@@ -513,6 +542,9 @@ def main():
         try:
             sent = processor(state, webhook_url)
             log(f"{name}: {sent} new item(s) sent.")
+        except SourceUnavailable as error:
+            # Transient upstream problem: nothing was lost, retry in 5 min.
+            log(f"::warning title={name} unavailable::{error}")
         except Exception as error:
             failures += 1
             log(f"::error title={name} check failed::{type(error).__name__}: {error}")
