@@ -10,6 +10,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
+import articles
+
 
 NEWS_URL = "https://supercell.com/en/games/brawlstars/blog/"
 YOUTUBE_CHANNEL_ID = "UCooVYzDxdwTtGYAkcPmOgOw"
@@ -178,14 +180,19 @@ def send_discord(
     if image_url:
         embed["image"] = {"url": image_url}
 
+    post_embeds(webhook_url, [embed])
+
+
+def post_embeds(webhook_url, embeds):
     payload = {
         "username": "Brawl Stars News",
-        "embeds": [embed],
+        "embeds": embeds,
         "allowed_mentions": {"parse": []},
     }
 
     if DRY_RUN:
-        log("[dry run] " + json.dumps(embed, ensure_ascii=False))
+        for embed in embeds:
+            log("[dry run] " + json.dumps(embed, ensure_ascii=False))
         return
 
     request = urllib.request.Request(
@@ -317,6 +324,7 @@ def get_article_meta(url):
     parser.feed(page)
 
     meta = parser.meta
+    article = articles.parse_article(page)
 
     image = meta.get("og:image") or meta.get("twitter:image")
 
@@ -326,7 +334,11 @@ def get_article_meta(url):
             meta.get("og:description") or meta.get("description") or ""
         ),
         "image": urllib.parse.urljoin(url, image) if image else None,
-        "published": meta.get("article:published_time"),
+        "published": (
+            meta.get("article:published_time")
+            or (article or {}).get("published")
+        ),
+        "article": article,
     }
 
 
@@ -459,19 +471,38 @@ def process_news(state, webhook_url):
         meta = get_article_meta(item["url"])
         category = classify_news(item["title"])
 
-        description = meta.get("description") or (
-            "Open the article for the full announcement."
+        messages = articles.build_balance_messages(
+            meta.get("article"),
+            intro_embed={
+                "title": f"{ICONS['balance']} {item['title']}"[:256],
+                "url": item["url"],
+                "color": COLORS["balance"],
+                "timestamp": (
+                    meta.get("published")
+                    or datetime.now(timezone.utc).isoformat()
+                ),
+                **({"image": {"url": meta["image"]}} if meta.get("image") else {}),
+            },
+            footer=f"Brawl Stars • {LABELS['balance']}",
         )
 
-        send_discord(
-            webhook_url,
-            title=item["title"],
-            description=shorten(description),
-            url=item["url"],
-            category=category,
-            image_url=meta.get("image"),
-            timestamp=meta.get("published"),
-        )
+        if messages:
+            for message in messages:
+                post_embeds(webhook_url, message)
+        else:
+            description = meta.get("description") or (
+                "Open the article for the full announcement."
+            )
+
+            send_discord(
+                webhook_url,
+                title=item["title"],
+                description=shorten(description),
+                url=item["url"],
+                category=category,
+                image_url=meta.get("image"),
+                timestamp=meta.get("published"),
+            )
 
         remember(state, "news", item["id"])
         save_state(state)
