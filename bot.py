@@ -537,16 +537,25 @@ def process_links(state, _webhook_url, purge=True):
     if missing:
         raise SystemExit(f"Account linking needs: {', '.join(missing)}")
 
-    def save_cursor(message_id):
-        state["link_cursor"] = message_id
+    def save_cursor(key, message_id):
+        state[f"{key}_cursor"] = message_id
         save_state(state)
 
     scanner = links.LinkScanner(
-        discord_api, fetch_player, channel, os.environ["DISCORD_GUILD_ID"]
+        discord_api,
+        fetch_player,
+        channel,
+        os.environ["DISCORD_GUILD_ID"],
+        command_channel_id=os.environ.get("COMMAND_CHANNEL_ID", "").strip(),
     )
 
+    cursors = {
+        "link": state.get("link_cursor"),
+        "command": state.get("command_cursor"),
+    }
+
     try:
-        stats = scanner.run(state.get("link_cursor"), save_cursor, purge=purge)
+        stats = scanner.run(cursors, save_cursor, purge=purge)
     except links.Unavailable as error:
         raise SourceUnavailable(str(error))
 

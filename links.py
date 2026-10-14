@@ -12,6 +12,8 @@ of members who left the server are deleted on every run.
 Chat commands, answered with a reply in the same channel:
     !profile [@member]    trophies, level, club, wins
     !stats [@member]      top brawlers
+They are read from a separate command channel when one is configured (the
+link channel is then for tags only); otherwise from the link channel.
 """
 
 import re
@@ -144,14 +146,20 @@ class LinkScanner:
     """
     api(method, path, payload=None) -> (status, json_or_None)
     fetch_player(tag) -> dict; raises NotFound / Unavailable
+
+    `command_channel` is optional; when set, commands are only honoured there
+    and the link channel only accepts tags.
     """
 
-    def __init__(self, api, fetch_player, channel_id, guild_id, pause=0.3):
+    def __init__(self, api, fetch_player, channel_id, guild_id,
+                 command_channel_id=None, pause=0.3):
         self.api = api
         self.fetch_player = fetch_player
         self.channel = channel_id
+        self.command_channel = command_channel_id or None
         self.guild = guild_id
         self.pause = pause
+        self._left = {}
 
     # -- Discord helpers --------------------------------------
 
@@ -163,13 +171,13 @@ class LinkScanner:
 
         return status, data
 
-    def history(self):
-        """Newest-first messages of the link channel (bounded)."""
+    def history(self, channel):
+        """Newest-first messages of a channel (bounded)."""
 
         messages, before = [], None
 
         for _ in range(MAX_HISTORY_PAGES):
-            path = f"/channels/{self.channel}/messages?limit=100"
+            path = f"/channels/{channel}/messages?limit=100"
 
             if before:
                 path += f"&before={before}"
@@ -177,7 +185,7 @@ class LinkScanner:
             status, page = self.api("GET", path)
 
             if status != 200 or not isinstance(page, list):
-                raise Unavailable(f"Could not read the link channel (HTTP {status}).")
+                raise Unavailable(f"Could not read channel {channel} (HTTP {status}).")
 
             messages.extend(page)
 
@@ -188,14 +196,14 @@ class LinkScanner:
 
         return messages
 
-    def react(self, message, emoji):
+    def react(self, channel, message, emoji):
         encoded = urllib.parse.quote(emoji)
         self._call(
             "PUT",
-            f"/channels/{self.channel}/messages/{message['id']}/reactions/{encoded}/@me",
+            f"/channels/{channel}/messages/{message['id']}/reactions/{encoded}/@me",
         )
 
-    def reply(self, message, content=None, embed=None):
+    def reply(self, channel, message, content=None, embed=None):
         payload = {
             "message_reference": {"message_id": message["id"], "fail_if_not_exists": False},
             "allowed_mentions": {"parse": []},
@@ -206,17 +214,23 @@ class LinkScanner:
         if embed:
             payload["embeds"] = [embed]
 
-        self._call("POST", f"/channels/{self.channel}/messages", payload)
+        self._call("POST", f"/channels/{channel}/messages", payload)
 
-    def delete(self, message_id):
-        self._call("DELETE", f"/channels/{self.channel}/messages/{message_id}")
+    def delete(self, channel, message_id):
+        self._call("DELETE", f"/channels/{channel}/messages/{message_id}")
 
     def has_left(self, user_id):
-        status, data = self.api("GET", f"/guilds/{self.guild}/members/{user_id}")
+        if user_id not in self._left:
+            status, data = self.api("GET", f"/guilds/{self.guild}/members/{user_id}")
 
-        # Only an explicit "Unknown Member/User" counts. Any error (including a
-        # wrong guild id, code 10004) must never be mistaken for "left".
-        return status == 404 and (data or {}).get("code") in UNKNOWN_MEMBER_CODES
+            # Only an explicit "Unknown Member/User" counts. Any error
+            # (including a wrong guild id, code 10004) must never be mistaken
+            # for "left".
+            self._left[user_id] = (
+                status == 404 and (data or {}).get("code") in UNKNOWN_MEMBER_CODES
+            )
+
+        return self._left[user_id]
 
     # -- derived state ----------------------------------------
 
@@ -228,7 +242,7 @@ class LinkScanner:
         )
 
     def linked_tags(self, messages):
-        """{discord_id: [tags]} from messages carrying the bot's ✅.
+        """{discord_id: [tags]} from messages carrying the bot's check mark.
 
         Edited messages are ignored: an edit could swap in a tag that was never
         validated, so editing effectively unlinks.
@@ -253,17 +267,24 @@ class LinkScanner:
 
     # -- privacy purge ----------------------------------------
 
-    def purge_departed(self, messages):
-        """Deletes messages (and bot replies about them) of members who left.
+    def purge_departed(self, channels):
+        """Deletes messages (and bot replies about them) of members who left,
+        in every given {channel_id: messages} mapping.
 
-        Returns (remaining_messages, removed_count).
+        Returns (remaining {channel_id: messages}, removed_count).
         """
 
-        authors = {m["author"]["id"] for m in messages if not m["author"].get("bot")}
+        self._left = {}
+        authors = {
+            m["author"]["id"]
+            for messages in channels.values()
+            for m in messages
+            if not m["author"].get("bot")
+        }
         left = {uid for uid in authors if self.has_left(uid)}
 
         if not left:
-            return messages, 0
+            return channels, 0
 
         def about_leaver(message):
             author = message["author"]
@@ -277,53 +298,76 @@ class LinkScanner:
             )
             return any(f"id:{uid}" in text or f"<@{uid}>" in text for uid in left)
 
-        doomed = [m for m in messages if about_leaver(m)]
+        remaining, removed = {}, 0
 
-        for message in doomed:
-            self.delete(message["id"])
+        for channel, messages in channels.items():
+            doomed = [m for m in messages if about_leaver(m)]
 
-        doomed_ids = {m["id"] for m in doomed}
-        return [m for m in messages if m["id"] not in doomed_ids], len(doomed)
+            for message in doomed:
+                self.delete(channel, message["id"])
+
+            removed += len(doomed)
+            doomed_ids = {m["id"] for m in doomed}
+            remaining[channel] = [m for m in messages if m["id"] not in doomed_ids]
+
+        return remaining, removed
 
     # -- main -------------------------------------------------
 
-    def run(self, cursor, save_cursor, purge=True):
-        """Processes new messages. `cursor` is the last handled message id.
+    def run(self, cursors, save_cursor, purge=True):
+        """Processes new messages in the link (and command) channel.
 
-        Returns a dict of counters.
+        `cursors` maps "link"/"command" to the last handled message id and
+        `save_cursor(key, id)` persists progress. Returns counters.
         """
 
         stats = {"linked": 0, "rejected": 0, "commands": 0, "purged": 0}
 
-        messages = self.history()
+        channels = {self.channel: self.history(self.channel)}
+
+        if self.command_channel:
+            channels[self.command_channel] = self.history(self.command_channel)
 
         if purge:
-            messages, stats["purged"] = self.purge_departed(messages)
+            channels, stats["purged"] = self.purge_departed(channels)
 
-        linked = self.linked_tags(messages)
-        last = int(cursor or 0)
+        linked = self.linked_tags(channels[self.channel])
 
-        for message in reversed(messages):  # oldest first
-            if int(message["id"]) <= last:
-                continue
+        # (cursor key, channel, accepts tags, accepts commands)
+        scans = [("link", self.channel, True, not self.command_channel)]
 
-            if not message["author"].get("bot"):
-                self._handle(message, linked, stats)
+        if self.command_channel:
+            scans.append(("command", self.command_channel, False, True))
 
-            last = int(message["id"])
-            save_cursor(str(last))
+        for key, channel, allow_links, allow_commands in scans:
+            last = int(cursors.get(key) or 0)
+
+            for message in reversed(channels[channel]):  # oldest first
+                if int(message["id"]) <= last:
+                    continue
+
+                if not message["author"].get("bot"):
+                    self._handle(channel, message, linked, stats,
+                                 allow_links, allow_commands)
+
+                last = int(message["id"])
+                save_cursor(key, str(last))
 
         return stats
 
-    def _handle(self, message, linked, stats):
+    def _handle(self, channel, message, linked, stats, allow_links, allow_commands):
         author = message["author"]["id"]
         content = message.get("content", "")
 
         command = parse_command(content)
 
         if command:
-            self._command(message, command, linked)
-            stats["commands"] += 1
+            if allow_commands:
+                self._command(channel, message, command, linked)
+                stats["commands"] += 1
+            return
+
+        if not allow_links:
             return
 
         if self._bot_reacted(message, OK) or self._bot_reacted(message, BAD):
@@ -353,27 +397,28 @@ class LinkScanner:
             mine.append(tag)
             accepted += 1
 
-        self.react(message, OK if accepted else BAD)
+        self.react(channel, message, OK if accepted else BAD)
         stats["linked" if accepted else "rejected"] += 1
 
-    def _command(self, message, command, linked):
+    def _command(self, channel, message, command, linked):
         kind, mentioned = command
         target = mentioned or message["author"]["id"]
         tags = linked.get(target)
 
         if not tags:
             # No mention of the target: a reply naming someone could outlive them
-            # if they leave, and they'd have no messages left to trigger a purge.
+            # if they leave, and they would have no messages left to trigger a purge.
             who = "You haven't" if target == message["author"]["id"] else "That member hasn't"
-            self.reply(message, f"{who} linked a Brawl Stars account yet. "
-                                "Post your tag (e.g. `#2PP0`) in this channel.")
+            self.reply(channel, message,
+                       f"{who} linked a Brawl Stars account yet. "
+                       "Post your tag (e.g. `#2PP0`) in the link channel.")
             return
 
         try:
             player = self.fetch_player(tags[0])
         except NotFound:
-            self.reply(message, "That linked tag no longer exists.")
+            self.reply(channel, message, "That linked tag no longer exists.")
             return
 
         build = profile_embed if kind == "profile" else stats_embed
-        self.reply(message, embed=build(player, target))
+        self.reply(channel, message, embed=build(player, target))

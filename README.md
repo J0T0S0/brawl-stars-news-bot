@@ -22,7 +22,7 @@ The scheduled run always uses the latest code on `main`, so no manual re-run is 
 Members link their Brawl Stars account by **posting their tag in one dedicated channel** (e.g. `#2PP0`).
 The bot (polling every minute), validates it with the Brawl Stars API and reacts ✅ (linked) or ❌ (unknown tag / limit of 3 reached).
 
-Chat commands in that channel: `!profile [@member]` and `!stats [@member]` (answered with a reply).
+Chat commands `!profile [@member]` and `!stats [@member]` go in a **separate command channel** (`COMMAND_CHANNEL_ID`) and are answered with a reply there; the link channel then only accepts tags. If `COMMAND_CHANNEL_ID` is unset, commands are read in the link channel instead.
 
 **Privacy:** the channel is the database. A link is the member's own message carrying the bot's ✅, so no
 personal data is written to this repository (`state.json` only stores the id of the last message scanned).
@@ -31,12 +31,12 @@ personal data is written to this repository (`state.json` only stores the id of 
 
 **Setup**
 1. Developer portal → your bot → enable **Message Content Intent**. Invite the bot to the channel with
-   *View Channel, Read Message History, Add Reactions, Send Messages, Manage Messages*.
+   *View Channel, Read Message History, Add Reactions, Send Messages, Manage Messages* (the command channel needs all but Add Reactions).
 2. Create a Brawl Stars API key at developer.brawlstars.com allowing IP `45.79.218.79`
    (the [RoyaleAPI proxy](https://docs.royaleapi.com/proxy.html), since GitHub Actions has no fixed IP;
    the key passes through that third party). A key made for your home IP will **not** work from Actions.
 3. Repository secrets: `DISCORD_BOT_TOKEN`, `BRAWLSTARS_API_KEY`.
-   Repository variables: `DISCORD_GUILD_ID`, `LINK_CHANNEL_ID`.
+   Repository variables: `DISCORD_GUILD_ID`, `LINK_CHANNEL_ID`, `COMMAND_CHANNEL_ID` (optional).
 
 Reactions and replies arrive within about a minute (see below). Tags are not ownership-verified
 (Supercell offers no way to prove an account is yours).

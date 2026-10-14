@@ -1,12 +1,15 @@
 import os
 import sys
 import unittest
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import links
 
 BOT = "999"
+LINK = "chan"
+CMD = "cmd"
 PLAYER = {
     "tag": "#2PP0", "name": "Tester", "trophies": 12345, "highestTrophies": 15000,
     "expLevel": 200, "club": {"name": "Club"},
@@ -16,19 +19,20 @@ PLAYER = {
 
 
 class FakeDiscord:
-    """In-memory channel + guild, speaking the same (method, path) API."""
+    """In-memory guild with channels, speaking the same (method, path) API."""
 
     def __init__(self, members):
         self.members = set(members)
-        self.messages = []     # oldest first
+        self.messages = []     # oldest first, each tagged with its channel
         self.next_id = 100
         self.reactions = {}    # message id -> [emoji]
         self.deleted = []
         self.guild_code = None
 
-    def post(self, author, content, **extra):
+    def post(self, author, content, channel=LINK, **extra):
         self.next_id += 1
-        message = {"id": str(self.next_id), "author": {"id": author, "bot": author == BOT},
+        message = {"id": str(self.next_id), "channel": channel,
+                   "author": {"id": author, "bot": author == BOT},
                    "content": content, "embeds": [], "edited_timestamp": None, **extra}
         self.messages.append(message)
         return message
@@ -38,9 +42,13 @@ class FakeDiscord:
                      for e in self.reactions.get(message["id"], [])]
         return {**message, "reactions": reactions}
 
+    def in_channel(self, channel):
+        return [m for m in self.messages if m["channel"] == channel]
+
     def __call__(self, method, path, payload=None):
         if method == "GET" and "/messages" in path:
-            newest_first = [self.view(m) for m in reversed(self.messages)]
+            channel = path.split("/channels/")[1].split("/")[0]
+            newest_first = [self.view(m) for m in reversed(self.in_channel(channel))]
             if "before=" in path:
                 before = int(path.split("before=")[1])
                 newest_first = [m for m in newest_first if int(m["id"]) < before]
@@ -55,12 +63,13 @@ class FakeDiscord:
         if method == "PUT" and "/reactions/" in path:
             mid = path.split("/messages/")[1].split("/")[0]
             emoji = path.split("/reactions/")[1].split("/")[0]
-            from urllib.parse import unquote
             self.reactions.setdefault(mid, []).append(unquote(emoji))
             return 204, None
 
         if method == "POST":
-            self.post(BOT, payload.get("content", ""), embeds=payload.get("embeds", []),
+            channel = path.split("/channels/")[1].split("/")[0]
+            self.post(BOT, payload.get("content", ""), channel=channel,
+                      embeds=payload.get("embeds", []),
                       reply_to=payload["message_reference"]["message_id"])
             return 200, {}
 
@@ -73,19 +82,30 @@ class FakeDiscord:
         raise AssertionError(f"unexpected call {method} {path}")
 
 
-def make(discord, known=("2PP0", "8Q2L", "9YY", "PPP")):
+def make(discord, command_channel=None, known=("2PP0", "8Q2L", "9YY", "PPP")):
     def fetch(tag):
         if tag not in known:
             raise links.NotFound(tag)
         return {**PLAYER, "tag": "#" + tag}
 
-    return links.LinkScanner(discord, fetch, "chan", "guild", pause=0)
+    return links.LinkScanner(discord, fetch, LINK, "guild",
+                             command_channel_id=command_channel, pause=0)
 
 
-def run(scanner, cursor=None):
-    saved = []
-    stats = scanner.run(cursor, saved.append)
-    return stats, saved
+def run(scanner, cursors=None, purge=True):
+    """Returns (stats, cursors) so a following run can resume."""
+    cursors = dict(cursors or {})
+
+    def save(key, value):
+        cursors[key] = value
+
+    stats = scanner.run(cursors, save, purge=purge)
+    return stats, cursors
+
+
+def bot_replies(d, channel=None):
+    return [m for m in d.messages if m["author"]["bot"]
+            and (channel is None or m["channel"] == channel)]
 
 
 class ParsingTests(unittest.TestCase):
@@ -108,7 +128,7 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(links.parse_command("!profilex"))
 
 
-class ScannerTests(unittest.TestCase):
+class LinkingTests(unittest.TestCase):
 
     def test_links_valid_tag_and_rejects_unknown(self):
         d = FakeDiscord({"1", "2"})
@@ -116,19 +136,19 @@ class ScannerTests(unittest.TestCase):
         bad = d.post("2", "#QQQQ")
         d.post("2", "just chatting")
 
-        stats, saved = run(make(d))
+        stats, cursors = run(make(d))
 
         self.assertEqual(d.reactions[good["id"]], [links.OK])
         self.assertEqual(d.reactions[bad["id"]], [links.BAD])
         self.assertEqual((stats["linked"], stats["rejected"]), (1, 1))
-        self.assertEqual(saved[-1], d.messages[-1]["id"])  # cursor advanced
+        self.assertEqual(cursors["link"], d.messages[-1]["id"])
 
     def test_cursor_prevents_reprocessing(self):
         d = FakeDiscord({"1"})
         d.post("1", "#2PP0")
         scanner = make(d)
-        _, saved = run(scanner)
-        run(scanner, saved[-1])
+        _, cursors = run(scanner)
+        run(scanner, cursors)
         self.assertEqual(sum(len(v) for v in d.reactions.values()), 1)
 
     def test_lost_cursor_does_not_double_react(self):
@@ -142,10 +162,8 @@ class ScannerTests(unittest.TestCase):
         d = FakeDiscord({"1"})
         for tag in ("2PP0", "8Q2L", "9YY", "PPP"):
             d.post("1", f"#{tag}")
-        scanner = make(d)
-        run(scanner)
-        last = d.messages[-1]["id"]
-        self.assertEqual(d.reactions[last], [links.BAD])
+        run(make(d))
+        self.assertEqual(d.reactions[d.messages[-1]["id"]], [links.BAD])
 
     def test_api_outage_keeps_message_for_retry(self):
         d = FakeDiscord({"1"})
@@ -154,10 +172,10 @@ class ScannerTests(unittest.TestCase):
         def down(tag):
             raise links.Unavailable("maintenance")
 
-        scanner = links.LinkScanner(d, down, "chan", "guild", pause=0)
+        scanner = links.LinkScanner(d, down, LINK, "guild", pause=0)
         saved = []
         with self.assertRaises(links.Unavailable):
-            scanner.run(None, saved.append)
+            scanner.run({}, lambda k, v: saved.append(v))
 
         self.assertEqual(saved, [])
         stats, _ = run(make(d))
@@ -171,14 +189,26 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual(stats["linked"], 0)
         self.assertEqual(d.reactions, {})
 
+    def test_deleting_your_message_unlinks(self):
+        d = FakeDiscord({"1", "2"})
+        mine = d.post("1", "#2PP0")
+        scanner = make(d)
+        _, cursors = run(scanner)
+        d.messages.remove(mine)
+        d.post("2", "!profile <@1>")
+        run(scanner, cursors)
+        self.assertIn("hasn't linked", d.messages[-1]["content"])
+
+
+class CommandTests(unittest.TestCase):
+
     def test_edited_messages_do_not_count_as_links(self):
         d = FakeDiscord({"1", "2"})
         d.post("1", "#8Q2L", edited_timestamp="2026-01-01T00:00:00")
         d.reactions["101"] = [links.OK]
         d.post("2", "!profile <@1>")
         run(make(d))
-        reply = d.messages[-1]
-        self.assertIn("hasn't linked", reply["content"])
+        self.assertIn("hasn't linked", d.messages[-1]["content"])
 
     def test_profile_and_stats_commands(self):
         d = FakeDiscord({"1", "2"})
@@ -188,22 +218,38 @@ class ScannerTests(unittest.TestCase):
         d.post("1", "!stats")
         run(make(d))
 
-        replies = [m for m in d.messages if m["author"]["bot"]]
+        replies = bot_replies(d)
         self.assertEqual(len(replies), 3)
         self.assertEqual(replies[0]["embeds"][0]["title"], "Tester")
         self.assertIn("id:1", replies[0]["embeds"][0]["footer"]["text"])
         self.assertIn("haven't linked", replies[1]["content"])
         self.assertIn("El Primo", replies[2]["embeds"][0]["description"])
 
-    def test_deleting_your_message_unlinks(self):
+    def test_separate_command_channel(self):
         d = FakeDiscord({"1", "2"})
-        mine = d.post("1", "#2PP0")
-        scanner = make(d)
-        run(scanner)
-        d.messages.remove(mine)
-        d.post("2", "!profile <@1>")
-        run(scanner, "101")
-        self.assertIn("hasn't linked", d.messages[-1]["content"])
+        d.post("1", "#2PP0")                               # link channel
+        d.post("2", "!profile <@1>", channel=CMD)          # command channel
+        d.post("2", "!profile <@1>", channel=LINK)         # ignored: wrong channel
+        d.post("2", "#8Q2L", channel=CMD)                  # tags ignored in commands
+        stats, _ = run(make(d, command_channel=CMD))
+
+        self.assertEqual(stats["commands"], 1)
+        self.assertEqual(stats["linked"], 1)
+        self.assertEqual(len(bot_replies(d, CMD)), 1)
+        self.assertEqual(bot_replies(d, CMD)[0]["embeds"][0]["title"], "Tester")
+        self.assertEqual(bot_replies(d, LINK), [])         # no reply in link channel
+        cmd_tag_message = d.in_channel(CMD)[1]
+        self.assertNotIn(cmd_tag_message["id"], d.reactions)
+
+    def test_command_channel_has_its_own_cursor(self):
+        d = FakeDiscord({"1"})
+        d.post("1", "#2PP0")
+        d.post("1", "!stats", channel=CMD)
+        scanner = make(d, command_channel=CMD)
+        _, cursors = run(scanner)
+        self.assertIn("command", cursors)
+        run(scanner, cursors)
+        self.assertEqual(len(bot_replies(d, CMD)), 1)      # not answered twice
 
 
 class PrivacyTests(unittest.TestCase):
@@ -215,11 +261,11 @@ class PrivacyTests(unittest.TestCase):
         d.post("2", "!profile <@1>")        # asks about 1, stays
         d.post("2", "!profile")             # asks about itself
         scanner = make(d)
-        _, saved = run(scanner)
+        _, cursors = run(scanner)
         before = len(d.messages)
 
         d.members.discard("1")              # 1 leaves
-        stats, _ = run(scanner, saved[-1])
+        stats, _ = run(scanner, cursors)
 
         # Nothing the bot posted may still reference the leaver. (Other
         # members' own messages that merely mention them are left alone.)
@@ -233,14 +279,29 @@ class PrivacyTests(unittest.TestCase):
         self.assertEqual(stats["purged"], 2)  # their message + the bot reply about them
         self.assertLess(len(d.messages), before)
 
+    def test_leaver_is_purged_from_command_channel_too(self):
+        d = FakeDiscord({"1", "2"})
+        d.post("1", "#2PP0")
+        d.post("2", "!profile <@1>", channel=CMD)
+        d.post("1", "!stats", channel=CMD)
+        scanner = make(d, command_channel=CMD)
+        _, cursors = run(scanner)
+        self.assertEqual(len(bot_replies(d, CMD)), 2)
+
+        d.members.discard("1")
+        stats, _ = run(scanner, cursors)
+
+        self.assertEqual([m["author"]["id"] for m in d.in_channel(CMD)], ["2"])
+        self.assertEqual(stats["purged"], 4)  # link msg, their command, 2 bot replies
+
     def test_leaver_cannot_be_looked_up_afterwards(self):
         d = FakeDiscord({"1", "2"})
         d.post("1", "#2PP0")
         scanner = make(d)
-        run(scanner)
+        _, cursors = run(scanner)
         d.members.discard("1")
         d.post("2", "!profile <@1>")
-        run(scanner, d.messages[-2]["id"])
+        run(scanner, cursors)
         self.assertIn("hasn't linked", d.messages[-1]["content"])
 
     def test_errors_never_purge(self):
