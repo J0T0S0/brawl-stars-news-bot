@@ -141,13 +141,14 @@ class LinkingTests(unittest.TestCase):
         d = FakeDiscord({"1", "2"})
         good = d.post("1", "#2PP0")
         bad = d.post("2", "#QQQQ")
-        d.post("2", "just chatting")
+        fake = d.post("2", "testidfake")
 
         stats, cursors = run(make(d))
 
         self.assertEqual(d.reactions[good["id"]], [links.OK])
         self.assertEqual(d.reactions[bad["id"]], [links.BAD])
-        self.assertEqual((stats["linked"], stats["rejected"]), (1, 1))
+        self.assertEqual(d.reactions[fake["id"]], [links.BAD])   # not even a tag
+        self.assertEqual((stats["linked"], stats["rejected"]), (1, 2))
         self.assertEqual(cursors["link"], d.messages[-1]["id"])
 
     def test_cursor_prevents_reprocessing(self):
@@ -343,15 +344,42 @@ class CleanupTests(unittest.TestCase):
         stats, _ = run(self.scanner, self.cursors)
         self.assertEqual(stats["cleaned"], 4)
 
-    def test_only_with_a_command_channel_and_when_enabled(self):
-        plain = make(self.d)                       # no command channel
-        stats, _ = run(plain, self.cursors)
-        self.assertEqual(stats["cleaned"], 0)
+    def test_without_command_channel_only_rejected_messages_go(self):
+        d = FakeDiscord({"1", "2"})
+        d.post("1", "#2PP0")
+        fake = d.post("2", "testidfake")
+        legacy = d.post("2", "old chatter")
+        d.reactions[legacy["id"]] = []          # never processed by the bot
+        d.messages.remove(legacy)
+        d.messages.insert(0, legacy)            # older than the cursor
+        scanner = make(d)
+        cursors = {"link": str(d.next_id)}      # everything counts as handled
 
+        d.reactions[fake["id"]] = [links.BAD]
+        stats, _ = run(scanner, cursors)
+
+        ids = {m["id"] for m in d.in_channel(LINK)}
+        self.assertNotIn(fake["id"], ids)
+        self.assertIn(legacy["id"], ids)        # unmarked chatter stays here
+        self.assertEqual(stats["cleaned"], 1)
+
+    def test_can_be_disabled(self):
         off = make(self.d, command_channel=CMD)
         off.cleanup = False
         stats, _ = run(off, self.cursors)
         self.assertEqual(stats["cleaned"], 0)
+
+
+class ContentIntentTests(unittest.TestCase):
+
+    def test_unreadable_messages_are_reported_not_rejected(self):
+        d = FakeDiscord({"1"})
+        d.post("1", "")                         # intent off: empty content
+        d.post("1", "", attachments=[{"id": "1"}])
+        stats, _ = run(make(d))
+        self.assertEqual(stats["blind"], 1)
+        self.assertEqual(stats["rejected"], 0)
+        self.assertEqual(d.reactions, {})
 
 
 class PrivacyTests(unittest.TestCase):

@@ -344,10 +344,12 @@ class LinkScanner:
 
     def clean_link_channel(self, messages, cursor):
         """Deletes members' messages in the link channel that are not a live
-        link: invalid tags (the bot marked them with a cross), chatter such as
-        "testidfake", and edited messages. Only messages the bot has already
-        processed and that are older than a grace period are touched, so people
-        still see the reaction. Returns the number deleted.
+        link. Messages the bot marked with a cross always qualify; with a
+        separate command channel the channel is tags-only, so anything else
+        that isn't a live link (old chatter, edited links) goes too. Only
+        messages the bot has already processed and that are older than a grace
+        period are touched, so people still see the reaction. Returns the
+        number deleted.
         """
 
         last = int(cursor or 0)
@@ -358,10 +360,12 @@ class LinkScanner:
             message_id = int(message["id"])
 
             live_link = self._bot_reacted(message, OK) and not message.get("edited_timestamp")
+            rejected = self._bot_reacted(message, BAD)
 
             if (
                 message["author"].get("bot")
                 or live_link
+                or not (rejected or self.command_channel)
                 or message_id > last
                 or now_ms - snowflake_ms(message_id) < CLEANUP_GRACE_SECONDS * 1000
             ):
@@ -382,7 +386,7 @@ class LinkScanner:
         """
 
         stats = {"linked": 0, "rejected": 0, "commands": 0, "purged": 0,
-                 "cleaned": 0}
+                 "cleaned": 0, "blind": 0}
 
         channels = {self.channel: self.history(self.channel)}
 
@@ -394,7 +398,7 @@ class LinkScanner:
 
         linked = self.linked_tags(channels[self.channel])
 
-        if purge and self.cleanup and self.command_channel:
+        if purge and self.cleanup:
             stats["cleaned"] = self.clean_link_channel(
                 channels[self.channel], cursors.get("link")
             )
@@ -442,6 +446,15 @@ class LinkScanner:
         tags = extract_tags(content)
 
         if not tags:
+            if content.strip():
+                # Not a valid tag (e.g. "testidfake"): mark it so people see why.
+                self.react(channel, message, BAD)
+                stats["rejected"] += 1
+            elif not (message.get("attachments") or message.get("embeds")
+                      or message.get("sticker_items")):
+                # Empty text with nothing attached: the bot cannot read message
+                # content (Message Content Intent is off).
+                stats["blind"] += 1
             return
 
         mine = linked.setdefault(author, [])

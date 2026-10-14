@@ -560,6 +560,13 @@ def process_links(state, _webhook_url, purge=True):
     except links.Unavailable as error:
         raise SourceUnavailable(str(error))
 
+    if stats["blind"]:
+        log(
+            f"::warning title=Links::{stats['blind']} message(s) had no readable "
+            "text. Enable the Message Content Intent for the bot in the Discord "
+            "developer portal, or links and commands cannot work."
+        )
+
     log(
         f"Links: {stats['linked']} linked, {stats['rejected']} rejected, "
         f"{stats['commands']} command(s), {stats['cleaned']} stray message(s) "
@@ -708,6 +715,11 @@ def main():
         failed = run_loop(state, webhook_url, RUN_MINUTES * 60)
     finally:
         persist_state()
+
+    if STOP:
+        # Told to stop (a cancelled run or a newer push is taking over). The
+        # workflow reads this marker so it doesn't start a competing successor.
+        open(".stopped", "w").close()
 
     if failed:
         sys.exit(1)

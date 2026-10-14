@@ -109,6 +109,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ -f .stopped ]; then
+            echo "Stopped on request; the run that replaced this one takes over."
+            exit 0
+          fi
           elapsed=$(( $(date +%s) - STARTED_AT ))
           if [ "$elapsed" -lt 600 ]; then
             echo "Run ended after ${elapsed}s, backing off before restarting."
