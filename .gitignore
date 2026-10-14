@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 state.json.tmp
+links.db
+links.db-journal
