@@ -22,7 +22,9 @@ The scheduled run always uses the latest code on `main`, so no manual re-run is 
 Members link their Brawl Stars account by **posting their tag in one dedicated channel** (e.g. `#2PP0`).
 The bot (polling every minute), validates it with the Brawl Stars API and reacts ✅ (linked) or ❌ (unknown tag / limit of 3 reached).
 
-Chat commands `!profile [@member]` and `!stats [@member]` go in a **separate command channel** (`COMMAND_CHANNEL_ID`) and are answered with a reply there; the link channel then only accepts tags. If `COMMAND_CHANNEL_ID` is unset, commands are read in the link channel instead.
+Chat commands `!profile [name]` and `!stats [name]` go in a **separate command channel** (`COMMAND_CHANNEL_ID`) and are answered with a reply there; the link channel then only accepts tags. Use the member's Discord name (`!profile alice`, no @ needed, so nobody gets a notification; a real @mention also works). `!profile me` or no name shows yourself. If `COMMAND_CHANNEL_ID` is unset, commands are read in the link channel instead.
+
+With a command channel configured, the link channel is kept tidy: invalid tags, chatter and edited messages are deleted 10 minutes after the bot has handled them (set the variable `LINK_CLEANUP` to `0` to disable). Linked messages (✅) are kept.
 
 **Privacy:** the channel is the database. A link is the member's own message carrying the bot's ✅, so no
 personal data is written to this repository (`state.json` only stores the id of the last message scanned).

@@ -30,7 +30,10 @@ UNKNOWN_MEMBER_CODES = (10007, 10013)
 TAG_CHARS = "0289PYLQGRJCUV"
 _TAG = re.compile(rf"^[{TAG_CHARS}]{{3,15}}$")
 _HASH_TAG = re.compile(r"#\s?([0-9A-Za-z]{3,15})\b")
-_COMMAND = re.compile(r"^\s*!(profile|stats)\b(?:\s+<@!?(\d+)>)?", re.I)
+_COMMAND = re.compile(r"^\s*!(profile|stats)\b[ \t]*(.*)$", re.I | re.S)
+_MENTION = re.compile(r"^<@!?(\d+)>$")
+CLEANUP_GRACE_SECONDS = 600
+DISCORD_EPOCH_MS = 1420070400000
 
 
 class NotFound(Exception):
@@ -75,7 +78,23 @@ def parse_command(content):
     if not match:
         return None
 
-    return match.group(1).lower(), match.group(2)
+    kind = match.group(1).lower()
+    argument = match.group(2).strip()
+
+    if not argument:
+        return kind, None
+
+    mention = _MENTION.match(argument.split()[0])
+
+    if mention:
+        return kind, ("id", mention.group(1))
+
+    # A plain name needs no @-mention, so nobody gets a notification.
+    return kind, ("name", argument.lstrip("@").strip()[:64])
+
+
+def snowflake_ms(message_id):
+    return (int(message_id) >> 22) + DISCORD_EPOCH_MS
 
 
 # ------------------------------------------------------------
@@ -152,14 +171,17 @@ class LinkScanner:
     """
 
     def __init__(self, api, fetch_player, channel_id, guild_id,
-                 command_channel_id=None, pause=0.3):
+                 command_channel_id=None, pause=0.3, cleanup=True):
         self.api = api
         self.fetch_player = fetch_player
         self.channel = channel_id
         self.command_channel = command_channel_id or None
         self.guild = guild_id
         self.pause = pause
+        self.cleanup = cleanup
+        self.now = time.time
         self._left = {}
+        self._names = {}
 
     # -- Discord helpers --------------------------------------
 
@@ -206,7 +228,7 @@ class LinkScanner:
     def reply(self, channel, message, content=None, embed=None):
         payload = {
             "message_reference": {"message_id": message["id"], "fail_if_not_exists": False},
-            "allowed_mentions": {"parse": []},
+            "allowed_mentions": {"parse": [], "replied_user": False},
         }
 
         if content:
@@ -241,6 +263,11 @@ class LinkScanner:
             for r in message.get("reactions", [])
         )
 
+    def _remember_name(self, author):
+        self._names[author["id"]] = [
+            n for n in (author.get("global_name"), author.get("username")) if n
+        ]
+
     def linked_tags(self, messages):
         """{discord_id: [tags]} from messages carrying the bot's check mark.
 
@@ -249,6 +276,7 @@ class LinkScanner:
         """
 
         linked = {}
+        self._names = {}
 
         for message in reversed(messages):  # oldest first
             if message["author"].get("bot") or message.get("edited_timestamp"):
@@ -257,7 +285,9 @@ class LinkScanner:
             if not self._bot_reacted(message, OK):
                 continue
 
-            tags = linked.setdefault(message["author"]["id"], [])
+            author = message["author"]
+            tags = linked.setdefault(author["id"], [])
+            self._remember_name(author)
 
             for tag in extract_tags(message.get("content")):
                 if tag not in tags and len(tags) < MAX_ACCOUNTS:
@@ -312,6 +342,36 @@ class LinkScanner:
 
         return remaining, removed
 
+    def clean_link_channel(self, messages, cursor):
+        """Deletes members' messages in the link channel that are not a live
+        link: invalid tags (the bot marked them with a cross), chatter such as
+        "testidfake", and edited messages. Only messages the bot has already
+        processed and that are older than a grace period are touched, so people
+        still see the reaction. Returns the number deleted.
+        """
+
+        last = int(cursor or 0)
+        now_ms = self.now() * 1000
+        removed = 0
+
+        for message in messages:
+            message_id = int(message["id"])
+
+            live_link = self._bot_reacted(message, OK) and not message.get("edited_timestamp")
+
+            if (
+                message["author"].get("bot")
+                or live_link
+                or message_id > last
+                or now_ms - snowflake_ms(message_id) < CLEANUP_GRACE_SECONDS * 1000
+            ):
+                continue
+
+            self.delete(self.channel, message["id"])
+            removed += 1
+
+        return removed
+
     # -- main -------------------------------------------------
 
     def run(self, cursors, save_cursor, purge=True):
@@ -321,7 +381,8 @@ class LinkScanner:
         `save_cursor(key, id)` persists progress. Returns counters.
         """
 
-        stats = {"linked": 0, "rejected": 0, "commands": 0, "purged": 0}
+        stats = {"linked": 0, "rejected": 0, "commands": 0, "purged": 0,
+                 "cleaned": 0}
 
         channels = {self.channel: self.history(self.channel)}
 
@@ -332,6 +393,11 @@ class LinkScanner:
             channels, stats["purged"] = self.purge_departed(channels)
 
         linked = self.linked_tags(channels[self.channel])
+
+        if purge and self.cleanup and self.command_channel:
+            stats["cleaned"] = self.clean_link_channel(
+                channels[self.channel], cursors.get("link")
+            )
 
         # (cursor key, channel, accepts tags, accepts commands)
         scans = [("link", self.channel, True, not self.command_channel)]
@@ -397,16 +463,63 @@ class LinkScanner:
             mine.append(tag)
             accepted += 1
 
+        if accepted:
+            self._remember_name(message["author"])
+
         self.react(channel, message, OK if accepted else BAD)
         stats["linked" if accepted else "rejected"] += 1
 
+    def display_name(self, user_id):
+        return (self._names.get(user_id) or [user_id])[0]
+
+    def find_members(self, query, linked):
+        """Linked members whose name matches, best match tier first
+        (exact, then starts-with, then contains)."""
+
+        query = query.casefold()
+
+        def names(uid):
+            return [n.casefold() for n in self._names.get(uid, [])]
+
+        for matches in (
+            lambda n: n == query,
+            lambda n: n.startswith(query),
+            lambda n: query in n,
+        ):
+            found = [uid for uid in linked if any(matches(n) for n in names(uid))]
+
+            if found:
+                return found
+
+        return []
+
     def _command(self, channel, message, command, linked):
-        kind, mentioned = command
-        target = mentioned or message["author"]["id"]
+        kind, argument = command
+        target = message["author"]["id"]
+
+        if argument and argument[0] == "id":
+            target = argument[1]
+        elif argument and argument[1].casefold() not in ("me", "myself"):
+            matches = self.find_members(argument[1], linked)
+
+            if not matches:
+                self.reply(channel, message,
+                           f"No linked member matches **{argument[1]}**. "
+                           "Use their Discord name, no @ needed.")
+                return
+
+            if len(matches) > 1:
+                names = ", ".join(self.display_name(uid) for uid in matches[:8])
+                self.reply(channel, message,
+                           f"Several linked members match: {names}. Be more specific.")
+                return
+
+            target = matches[0]
+
         tags = linked.get(target)
 
         if not tags:
-            # No mention of the target: a reply naming someone could outlive them
+            # Never name the target: a reply naming someone could outlive them
             # if they leave, and they would have no messages left to trigger a purge.
             who = "You haven't" if target == message["author"]["id"] else "That member hasn't"
             self.reply(channel, message,

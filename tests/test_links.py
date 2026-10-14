@@ -18,6 +18,9 @@ PLAYER = {
 }
 
 
+NAMES = {"1": "Alice", "2": "Bob", "3": "alicia"}
+
+
 class FakeDiscord:
     """In-memory guild with channels, speaking the same (method, path) API."""
 
@@ -32,7 +35,8 @@ class FakeDiscord:
     def post(self, author, content, channel=LINK, **extra):
         self.next_id += 1
         message = {"id": str(self.next_id), "channel": channel,
-                   "author": {"id": author, "bot": author == BOT},
+                   "author": {"id": author, "bot": author == BOT,
+                              "username": NAMES.get(author, f"user{author}")},
                    "content": content, "embeds": [], "edited_timestamp": None, **extra}
         self.messages.append(message)
         return message
@@ -122,8 +126,11 @@ class ParsingTests(unittest.TestCase):
 
     def test_commands(self):
         self.assertEqual(links.parse_command("!profile"), ("profile", None))
-        self.assertEqual(links.parse_command("!STATS <@123>"), ("stats", "123"))
-        self.assertEqual(links.parse_command("!profile <@!42>"), ("profile", "42"))
+        self.assertEqual(links.parse_command("!STATS <@123>"), ("stats", ("id", "123")))
+        self.assertEqual(links.parse_command("!profile <@!42>"), ("profile", ("id", "42")))
+        self.assertEqual(links.parse_command("!profile Alice"), ("profile", ("name", "Alice")))
+        self.assertEqual(links.parse_command("!profile  @alice smith "),
+                         ("profile", ("name", "alice smith")))
         self.assertIsNone(links.parse_command("profile"))
         self.assertIsNone(links.parse_command("!profilex"))
 
@@ -250,6 +257,101 @@ class CommandTests(unittest.TestCase):
         self.assertIn("command", cursors)
         run(scanner, cursors)
         self.assertEqual(len(bot_replies(d, CMD)), 1)      # not answered twice
+
+
+class NameLookupTests(unittest.TestCase):
+
+    def setUp(self):
+        self.d = FakeDiscord({"1", "2", "3"})
+        self.d.post("1", "#2PP0")
+        self.d.post("3", "#8Q2L")
+        self.scanner = make(self.d)
+
+    def ask(self, text):
+        self.d.post("2", text)
+        run(self.scanner)
+        return bot_replies(self.d)[-1]
+
+    def test_lookup_by_name_without_mentioning(self):
+        reply = self.ask("!profile alice")          # exact beats "alicia"
+        self.assertEqual(reply["embeds"][0]["title"], "Tester")
+        self.assertIn("id:1", reply["embeds"][0]["footer"]["text"])
+
+    def test_at_sign_is_optional_and_case_insensitive(self):
+        reply = self.ask("!stats @ALICE")
+        self.assertIn("El Primo", reply["embeds"][0]["description"])
+
+    def test_prefix_match_and_ambiguity(self):
+        self.assertIn("Several linked members match",
+                      self.ask("!profile ali")["content"])
+        self.assertIn("Alice", self.ask("!profile ali")["content"])
+
+    def test_unknown_name(self):
+        self.assertIn("No linked member matches", self.ask("!profile nobody")["content"])
+
+    def test_me_means_yourself(self):
+        self.d.post("2", "!profile me")
+        run(self.scanner)
+        self.assertIn("haven't linked", bot_replies(self.d)[-1]["content"])
+
+    def test_replies_never_ping(self):
+        sent = []
+        original = self.d.__call__
+
+        def spy(method, path, payload=None):
+            if method == "POST":
+                sent.append(payload)
+            return original(method, path, payload)
+
+        scanner = make(self.d)
+        scanner.api = spy
+        self.d.post("2", "!profile alice")
+        scanner.run({}, lambda k, v: None)
+        self.assertEqual(sent[0]["allowed_mentions"],
+                         {"parse": [], "replied_user": False})
+
+
+class CleanupTests(unittest.TestCase):
+
+    def setUp(self):
+        self.d = FakeDiscord({"1", "2"})
+        self.ok = self.d.post("1", "#2PP0")
+        self.junk = self.d.post("2", "testidfake")
+        self.bad = self.d.post("2", "#QQQQ")
+        self.chat = self.d.post("2", "hello there")
+        self.scanner = make(self.d, command_channel=CMD)
+        _, self.cursors = run(self.scanner)   # first pass: processes, nothing old enough
+
+    def test_stray_messages_removed_after_processing_but_links_kept(self):
+        stats, _ = run(self.scanner, self.cursors)
+        remaining = {m["id"] for m in self.d.in_channel(LINK)}
+        self.assertEqual(remaining, {self.ok["id"]})
+        self.assertEqual(stats["cleaned"], 3)
+
+    def test_grace_period_lets_people_see_the_reaction(self):
+        self.scanner.now = lambda: links.snowflake_ms(self.chat["id"]) / 1000 + 30
+        stats, _ = run(self.scanner, self.cursors)
+        self.assertEqual(stats["cleaned"], 0)
+        self.assertEqual(len(self.d.in_channel(LINK)), 4)
+
+    def test_unprocessed_messages_are_never_deleted(self):
+        stats, _ = run(self.scanner, {"link": self.ok["id"]})   # cursor stops early
+        self.assertEqual(stats["cleaned"], 0)
+
+    def test_edited_links_are_removed(self):
+        self.ok["edited_timestamp"] = "2026-01-01T00:00:00"
+        stats, _ = run(self.scanner, self.cursors)
+        self.assertEqual(stats["cleaned"], 4)
+
+    def test_only_with_a_command_channel_and_when_enabled(self):
+        plain = make(self.d)                       # no command channel
+        stats, _ = run(plain, self.cursors)
+        self.assertEqual(stats["cleaned"], 0)
+
+        off = make(self.d, command_channel=CMD)
+        off.cleanup = False
+        stats, _ = run(off, self.cursors)
+        self.assertEqual(stats["cleaned"], 0)
 
 
 class PrivacyTests(unittest.TestCase):

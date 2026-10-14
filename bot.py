@@ -547,6 +547,7 @@ def process_links(state, _webhook_url, purge=True):
         channel,
         os.environ["DISCORD_GUILD_ID"],
         command_channel_id=os.environ.get("COMMAND_CHANNEL_ID", "").strip(),
+        cleanup=os.environ.get("LINK_CLEANUP", "1") != "0",
     )
 
     cursors = {
@@ -561,8 +562,8 @@ def process_links(state, _webhook_url, purge=True):
 
     log(
         f"Links: {stats['linked']} linked, {stats['rejected']} rejected, "
-        f"{stats['commands']} command(s), {stats['purged']} message(s) of "
-        "departed members removed."
+        f"{stats['commands']} command(s), {stats['cleaned']} stray message(s) "
+        f"cleaned, {stats['purged']} message(s) of departed members removed."
     )
 
     return sum(stats.values())
