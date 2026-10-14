@@ -31,6 +31,7 @@ class FakeDiscord:
         self.reactions = {}    # message id -> [emoji]
         self.deleted = []
         self.guild_code = None
+        self.forbid_reactions = False
 
     def post(self, author, content, channel=LINK, **extra):
         self.next_id += 1
@@ -65,6 +66,8 @@ class FakeDiscord:
             return (200, {}) if uid in self.members else (404, {"code": 10007})
 
         if method == "PUT" and "/reactions/" in path:
+            if self.forbid_reactions:
+                return 403, {"code": 50013}
             mid = path.split("/messages/")[1].split("/")[0]
             emoji = path.split("/reactions/")[1].split("/")[0]
             self.reactions.setdefault(mid, []).append(unquote(emoji))
@@ -125,14 +128,19 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(len(links.extract_tags("#PPP #YYY #LLL #QQQ #GGG")), 3)
 
     def test_commands(self):
-        self.assertEqual(links.parse_command("!profile"), ("profile", None))
-        self.assertEqual(links.parse_command("!STATS <@123>"), ("stats", ("id", "123")))
-        self.assertEqual(links.parse_command("!profile <@!42>"), ("profile", ("id", "42")))
-        self.assertEqual(links.parse_command("!profile Alice"), ("profile", ("name", "Alice")))
-        self.assertEqual(links.parse_command("!profile  @alice smith "),
-                         ("profile", ("name", "alice smith")))
-        self.assertIsNone(links.parse_command("profile"))
-        self.assertIsNone(links.parse_command("!profilex"))
+        pc = links.parse_command
+        self.assertEqual(pc("!profile"), ("profile", None, None))
+        self.assertEqual(pc("!STATS <@123>"), ("stats", ("id", "123"), None))
+        self.assertEqual(pc("!profile <@!42>"), ("profile", ("id", "42"), None))
+        self.assertEqual(pc("!profile Alice"), ("profile", ("name", "Alice"), None))
+        self.assertEqual(pc("!profile  @alice smith "), ("profile", ("name", "alice smith"), None))
+        self.assertEqual(pc("!profile alice 2"), ("profile", ("name", "alice"), 2))
+        self.assertEqual(pc("!stats 3"), ("stats", None, 3))
+        self.assertEqual(pc("!profile <@5> 2"), ("profile", ("id", "5"), 2))
+        self.assertEqual(pc("!profile player4"), ("profile", ("name", "player4"), None))
+        self.assertEqual(pc("!help"), ("help", None, None))
+        self.assertIsNone(pc("profile"))
+        self.assertIsNone(pc("!profilex"))
 
 
 class LinkingTests(unittest.TestCase):
@@ -258,6 +266,46 @@ class CommandTests(unittest.TestCase):
         self.assertIn("command", cursors)
         run(scanner, cursors)
         self.assertEqual(len(bot_replies(d, CMD)), 1)      # not answered twice
+
+
+class CommandFeatureTests(unittest.TestCase):
+
+    def setUp(self):
+        self.d = FakeDiscord({"1", "2"})
+        self.d.post("1", "#2PP0 #8Q2L")
+        self.scanner = make(self.d, command_channel=CMD)
+        _, self.cursors = run(self.scanner)
+
+    def ask(self, text, author="2"):
+        self.d.post(author, text, channel=CMD)
+        run(self.scanner, self.cursors)
+        return bot_replies(self.d, CMD)[-1]
+
+    def test_help(self):
+        reply = self.ask("!help")
+        self.assertIn("!profile", reply["content"])
+        self.assertIn(f"<#{LINK}>", reply["content"])
+
+    def test_pick_second_account(self):
+        first = self.ask("!profile alice")
+        second = self.ask("!profile alice 2")
+        self.assertEqual(first["embeds"][0]["description"], "`#2PP0`")
+        self.assertEqual(second["embeds"][0]["description"], "`#8Q2L`")
+
+    def test_account_index_out_of_range(self):
+        self.assertIn("only 2 linked accounts", self.ask("!profile alice 3")["content"])
+
+    def test_command_flood_is_capped(self):
+        for _ in range(6):
+            self.d.post("2", "!help", channel=CMD)
+        stats, _ = run(self.scanner, self.cursors)
+        self.assertEqual(stats["commands"], links.MAX_COMMANDS_PER_USER)
+
+    def test_missing_permissions_are_reported(self):
+        self.d.forbid_reactions = True
+        self.d.post("2", "#QQQQ")
+        run(self.scanner, self.cursors)
+        self.assertTrue(any("403" in w for w in self.scanner.warnings))
 
 
 class NameLookupTests(unittest.TestCase):

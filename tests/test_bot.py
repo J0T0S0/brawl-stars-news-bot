@@ -148,6 +148,38 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class HealthTests(unittest.TestCase):
+
+    def test_alert_once_after_repeated_failures_then_recovery(self):
+        sent = []
+        streaks, alerted = {}, set()
+
+        with mock.patch.object(bot, "send_alert",
+                               lambda webhook, title, *a: sent.append(title)):
+            for _ in range(bot.ALERT_AFTER + 3):
+                bot.track_health("w", streaks, {"links": "RuntimeError: boom"}, alerted)
+
+            self.assertEqual(len(sent), 1)
+            self.assertIn("Links has been failing", sent[0])
+
+            bot.track_health("w", streaks, {"links": None}, alerted)
+            bot.track_health("w", streaks, {"links": None}, alerted)
+            self.assertEqual(len(sent), 2)
+            self.assertIn("working again", sent[1])
+
+    def test_short_blips_do_not_alert(self):
+        sent = []
+        streaks, alerted = {}, set()
+
+        with mock.patch.object(bot, "send_alert", lambda *a: sent.append(a)):
+            for _ in range(10):
+                bot.track_health("w", streaks, {"news": "boom"}, alerted)
+                bot.track_health("w", streaks, {"news": "boom"}, alerted)
+                bot.track_health("w", streaks, {"news": None}, alerted)
+
+        self.assertEqual(sent, [])
+
+
 class StateTests(unittest.TestCase):
 
     def setUp(self):

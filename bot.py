@@ -560,6 +560,12 @@ def process_links(state, _webhook_url, purge=True):
     except links.Unavailable as error:
         raise SourceUnavailable(str(error))
 
+    for warning in sorted(scanner.warnings):
+        log(
+            f"::warning title=Links::Discord: {warning}. Check the bot's "
+            "permissions in the link/command channels."
+        )
+
     if stats["blind"]:
         log(
             f"::warning title=Links::{stats['blind']} message(s) had no readable "
@@ -735,8 +741,11 @@ PROCESSORS = {
 }
 
 
-def run_sources(state, webhook_url, names, **options):
-    """Runs the named sources, each isolated. Returns the number of failures."""
+def run_sources(state, webhook_url, names, results=None, **options):
+    """Runs the named sources, each isolated. Returns the number of failures.
+
+    If `results` is given it is filled with {key: error message or None}.
+    """
 
     failures = 0
 
@@ -747,14 +756,64 @@ def run_sources(state, webhook_url, names, **options):
         try:
             handled = processor(state, webhook_url, **options.get(key, {}))
             log(f"{name}: {handled} item(s) handled.")
+
+            if results is not None:
+                results[key] = None
         except SourceUnavailable as error:
             # Transient upstream problem: nothing was lost, retried next cycle.
             log(f"::warning title={name} unavailable::{error}")
+
+            if results is not None:
+                results[key] = f"unavailable: {error}"
         except Exception as error:
             failures += 1
             log(f"::error title={name} check failed::{type(error).__name__}: {error}")
 
+            if results is not None:
+                results[key] = f"{type(error).__name__}: {error}"
+
     return failures
+
+
+ALERT_AFTER = 5  # consecutive failed cycles before posting an alert
+
+
+def send_alert(webhook_url, title, description, color):
+    try:
+        post_embeds(webhook_url, [{
+            "title": title[:256],
+            "description": description[:2000],
+            "color": color,
+            "footer": {"text": "Brawl Stars bot • status"},
+        }])
+    except Exception as error:  # an alert must never take the bot down
+        log(f"Could not send status alert: {error}")
+
+
+def track_health(webhook_url, streaks, results, alerted):
+    """Posts one alert when a source keeps failing, and one when it recovers."""
+
+    for key, error in results.items():
+        name = PROCESSORS[key][0]
+
+        if error:
+            streaks[key] = streaks.get(key, 0) + 1
+
+            if streaks[key] == ALERT_AFTER and key not in alerted:
+                alerted.add(key)
+                send_alert(
+                    webhook_url,
+                    f"⚠️ {name} has been failing",
+                    f"{ALERT_AFTER} checks in a row failed. Latest error:\n"
+                    f"```{error[:500]}```",
+                    0xE74C3C,
+                )
+        else:
+            streaks[key] = 0
+
+            if key in alerted:
+                alerted.discard(key)
+                send_alert(webhook_url, f"✅ {name} is working again", "", 0x2ECC71)
 
 
 def persist_state():
@@ -800,6 +859,7 @@ def run_loop(
     deadline = clock() + seconds
     next_news = next_purge = clock()
     failed = False
+    streaks, alerted = {}, set()
 
     while not STOP and clock() < deadline:
         started = clock()
@@ -814,7 +874,11 @@ def run_loop(
             next_purge = started + PURGE_INTERVAL
 
         names.append("links")
-        failed = bool(run_sources(state, webhook_url, names, **options))
+        results = {}
+        failed = bool(
+            run_sources(state, webhook_url, names, results=results, **options)
+        )
+        track_health(webhook_url, streaks, results, alerted)
         persist_state()
 
         # Interruptible wait until the next tick.

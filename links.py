@@ -30,7 +30,8 @@ UNKNOWN_MEMBER_CODES = (10007, 10013)
 TAG_CHARS = "0289PYLQGRJCUV"
 _TAG = re.compile(rf"^[{TAG_CHARS}]{{3,15}}$")
 _HASH_TAG = re.compile(r"#\s?([0-9A-Za-z]{3,15})\b")
-_COMMAND = re.compile(r"^\s*!(profile|stats)\b[ \t]*(.*)$", re.I | re.S)
+_COMMAND = re.compile(r"^\s*!(profile|stats|help)\b[ \t]*(.*)$", re.I | re.S)
+MAX_COMMANDS_PER_USER = 3          # per run, so nobody can flood the API
 _MENTION = re.compile(r"^<@!?(\d+)>$")
 CLEANUP_GRACE_SECONDS = 600
 DISCORD_EPOCH_MS = 1420070400000
@@ -73,24 +74,34 @@ def extract_tags(content):
 
 
 def parse_command(content):
+    """-> (kind, target, index) or None.
+
+    target is None (yourself), ("id", discord_id) for an @mention, or
+    ("name", text). index (1-3) picks one of a member's linked accounts.
+    """
+
     match = _COMMAND.match(content or "")
 
     if not match:
         return None
 
     kind = match.group(1).lower()
-    argument = match.group(2).strip()
+    tokens = match.group(2).split()
+    index = None
 
-    if not argument:
-        return kind, None
+    if tokens and tokens[-1] in ("1", "2", "3"):
+        index = int(tokens.pop())
 
-    mention = _MENTION.match(argument.split()[0])
+    if not tokens:
+        return kind, None, index
+
+    mention = _MENTION.match(tokens[0])
 
     if mention:
-        return kind, ("id", mention.group(1))
+        return kind, ("id", mention.group(1)), index
 
     # A plain name needs no @-mention, so nobody gets a notification.
-    return kind, ("name", argument.lstrip("@").strip()[:64])
+    return kind, ("name", " ".join(tokens).lstrip("@").strip()[:64]), index
 
 
 def snowflake_ms(message_id):
@@ -182,11 +193,19 @@ class LinkScanner:
         self.now = time.time
         self._left = {}
         self._names = {}
+        self._command_counts = {}
+        self.warnings = set()
 
     # -- Discord helpers --------------------------------------
 
     def _call(self, method, path, payload=None):
         status, data = self.api(method, path, payload)
+
+        # 404 just means the message is already gone. Anything else (almost
+        # always 403) is a setup problem worth surfacing.
+        if status >= 400 and status != 404:
+            kind = re.sub(r"\d+", "#", path.split("?")[0])
+            self.warnings.add(f"{method} {kind} returned HTTP {status}")
 
         if method != "GET":
             time.sleep(self.pause)
@@ -387,6 +406,8 @@ class LinkScanner:
 
         stats = {"linked": 0, "rejected": 0, "commands": 0, "purged": 0,
                  "cleaned": 0, "blind": 0}
+        self._command_counts = {}
+        self.warnings = set()
 
         channels = {self.channel: self.history(self.channel)}
 
@@ -433,8 +454,12 @@ class LinkScanner:
 
         if command:
             if allow_commands:
-                self._command(channel, message, command, linked)
-                stats["commands"] += 1
+                used = self._command_counts.get(author, 0)
+                self._command_counts[author] = used + 1
+
+                if used < MAX_COMMANDS_PER_USER:
+                    self._command(channel, message, command, linked)
+                    stats["commands"] += 1
             return
 
         if not allow_links:
@@ -506,8 +531,26 @@ class LinkScanner:
 
         return []
 
+    def help_text(self):
+        where = f"<#{self.channel}>"
+        return (
+            "**Brawl Stars account linking**\n"
+            f"Post your player tag (e.g. `#2PP0`) in {where} to link it "
+            f"(up to {MAX_ACCOUNTS} accounts). Delete the message to unlink.\n\n"
+            "`!profile [name] [1-3]` shows a linked player's profile\n"
+            "`!stats [name] [1-3]` shows their top brawlers\n"
+            "Use the member's Discord name, no @ needed (nobody gets pinged). "
+            "Leave the name out for yourself; the number picks one of "
+            "their linked accounts."
+        )
+
     def _command(self, channel, message, command, linked):
-        kind, argument = command
+        kind, argument, index = command
+
+        if kind == "help":
+            self.reply(channel, message, self.help_text())
+            return
+
         target = message["author"]["id"]
 
         if argument and argument[0] == "id":
@@ -537,11 +580,19 @@ class LinkScanner:
             who = "You haven't" if target == message["author"]["id"] else "That member hasn't"
             self.reply(channel, message,
                        f"{who} linked a Brawl Stars account yet. "
-                       "Post your tag (e.g. `#2PP0`) in the link channel.")
+                       f"Post your tag (e.g. `#2PP0`) in <#{self.channel}>.")
+            return
+
+        position = (index or 1) - 1
+
+        if position >= len(tags):
+            self.reply(channel, message,
+                       f"That member has only {len(tags)} linked account"
+                       f"{'s' if len(tags) != 1 else ''}.")
             return
 
         try:
-            player = self.fetch_player(tags[0])
+            player = self.fetch_player(tags[position])
         except NotFound:
             self.reply(channel, message, "That linked tag no longer exists.")
             return
