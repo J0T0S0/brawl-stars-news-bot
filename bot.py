@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 
 import articles
+import links
 
 
 NEWS_URL = "https://supercell.com/en/games/brawlstars/blog/"
@@ -446,6 +447,111 @@ def shorten(text, limit=350):
 
 
 # ------------------------------------------------------------
+# ACCOUNT LINKING (see links.py)
+# ------------------------------------------------------------
+
+DISCORD_API = "https://discord.com/api/v10"
+# Supercell only accepts requests from whitelisted IPs, which GitHub Actions
+# doesn't have, so calls go through RoyaleAPI's fixed-IP proxy by default
+# (whitelist 45.79.218.79 on the key). Override to call the API directly.
+BRAWLSTARS_API_BASE = os.environ.get(
+    "BRAWLSTARS_API_BASE", "https://bsproxy.royaleapi.dev/v1"
+)
+
+
+def discord_api(method, path, payload=None):
+    """Bot-authenticated Discord REST call -> (status, parsed JSON or None)."""
+
+    request = urllib.request.Request(
+        DISCORD_API + path,
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+        headers={
+            "Authorization": f"Bot {os.environ['DISCORD_BOT_TOKEN']}",
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (brawl-stars-news-bot, 2.0)",
+        },
+        method=method,
+    )
+
+    try:
+        status, body = request_with_retry(request)
+    except urllib.error.HTTPError as error:
+        status, body = error.code, error.read()
+    except OSError as error:
+        raise links.Unavailable(f"Discord unreachable: {error}")
+
+    try:
+        return status, (json.loads(body) if body else None)
+    except ValueError:
+        return status, None
+
+
+def fetch_player(tag):
+    request = urllib.request.Request(
+        f"{BRAWLSTARS_API_BASE}/players/%23{tag}",
+        headers={
+            "Authorization": f"Bearer {os.environ['BRAWLSTARS_API_KEY']}",
+            "User-Agent": USER_AGENT,
+        },
+    )
+
+    try:
+        return json.loads(request_with_retry(request)[1])
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise links.NotFound(tag)
+        if error.code == 403:
+            raise links.Unavailable(
+                "Brawl Stars API rejected the key (is the proxy IP whitelisted?)"
+            )
+        raise links.Unavailable(f"Brawl Stars API returned HTTP {error.code}")
+    except (OSError, ValueError) as error:
+        raise links.Unavailable(f"Brawl Stars API unreachable: {error}")
+
+
+def process_links(state, _webhook_url):
+    channel = os.environ.get("LINK_CHANNEL_ID", "").strip()
+
+    if not channel:
+        log("Links: LINK_CHANNEL_ID not set, skipping.")
+        return 0
+
+    if DRY_RUN:
+        log("Links: dry run, skipping (this source reads and writes Discord).")
+        return 0
+
+    missing = [
+        name
+        for name in ("DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID", "BRAWLSTARS_API_KEY")
+        if not os.environ.get(name)
+    ]
+
+    if missing:
+        raise SystemExit(f"Account linking needs: {', '.join(missing)}")
+
+    def save_cursor(message_id):
+        state["link_cursor"] = message_id
+        save_state(state)
+
+    scanner = links.LinkScanner(
+        discord_api, fetch_player, channel, os.environ["DISCORD_GUILD_ID"]
+    )
+
+    try:
+        stats = scanner.run(state.get("link_cursor"), save_cursor)
+    except links.Unavailable as error:
+        raise SourceUnavailable(str(error))
+
+    log(
+        f"Links: {stats['linked']} linked, {stats['rejected']} rejected, "
+        f"{stats['commands']} command(s), {stats['purged']} message(s) of "
+        "departed members removed."
+    )
+
+    return sum(stats.values())
+
+
+# ------------------------------------------------------------
 # PROCESSORS
 # ------------------------------------------------------------
 
@@ -569,10 +675,16 @@ def main():
     failures = 0
 
     # Each source is isolated: one failing never blocks the other.
-    for name, processor in (("News", process_news), ("YouTube", process_youtube)):
+    sources = (
+        ("News", process_news),
+        ("YouTube", process_youtube),
+        ("Links", process_links),
+    )
+
+    for name, processor in sources:
         try:
-            sent = processor(state, webhook_url)
-            log(f"{name}: {sent} new item(s) sent.")
+            handled = processor(state, webhook_url)
+            log(f"{name}: {handled} item(s) handled.")
         except SourceUnavailable as error:
             # Transient upstream problem: nothing was lost, retry in 5 min.
             log(f"::warning title={name} unavailable::{error}")

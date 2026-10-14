@@ -9,6 +9,8 @@ on:
     branches: [main]
     paths:
       - bot.py
+      - links.py
+      - articles.py
       - tests/**
       - .github/workflows/news.yml
 
@@ -51,6 +53,11 @@ jobs:
       - name: Run Brawl Stars news bot
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Account linking (optional): leave LINK_CHANNEL_ID unset to disable.
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          BRAWLSTARS_API_KEY: ${{ secrets.BRAWLSTARS_API_KEY }}
+          DISCORD_GUILD_ID: ${{ vars.DISCORD_GUILD_ID }}
+          LINK_CHANNEL_ID: ${{ vars.LINK_CHANNEL_ID }}
         run: python bot.py
 
       # Runs even if one source failed, so already-sent posts are persisted.
