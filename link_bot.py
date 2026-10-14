@@ -1,9 +1,10 @@
-"""Discord bot that lets members link their Minecraft (Java) account.
+"""Discord bot that lets members link their Brawl Stars and Minecraft accounts.
 
 Slash commands:
-  /link <username>    link your Minecraft account
-  /unlink             remove your link
-  /minecraft [member] show the Minecraft account linked to a member
+  /link brawlstars <tag>       link your Brawl Stars player tag
+  /link minecraft <username>   link your Minecraft (Java) account
+  /unlink <game>               remove a link
+  /accounts [member]           show the accounts linked to a member
 
 Privacy: links are deleted as soon as a member leaves the server, when the
 bot is removed from a server, and on startup for anyone who left while the
@@ -12,6 +13,8 @@ bot was offline.
 Unlike bot.py this needs a long-running process (it must answer commands),
 so it is not run by GitHub Actions. Requires DISCORD_BOT_TOKEN and the
 "Server Members Intent" enabled in the Discord developer portal.
+BRAWL_STARS_API_KEY (from developer.brawlstars.com) is optional: with it
+tags are checked and the player name is shown.
 """
 
 import asyncio
@@ -23,10 +26,28 @@ from discord import app_commands
 import links
 
 DB_FILE = os.environ.get("LINKS_DB", "links.db")
+BRAWL_STARS_API_KEY = os.environ.get("BRAWL_STARS_API_KEY", "").strip()
+
+GAME_CHOICES = [
+    app_commands.Choice(name=label, value=game) for game, label in links.GAMES.items()
+]
 
 
 def log(message):
     print(message, flush=True)
+
+
+def esc(text):
+    return discord.utils.escape_markdown(text)
+
+
+async def reply(interaction, message, **kwargs):
+    kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True, **kwargs)
+    else:
+        await interaction.response.send_message(message, ephemeral=True, **kwargs)
 
 
 class LinkBot(discord.Client):
@@ -40,9 +61,9 @@ class LinkBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        self.tree.add_command(link_command)
+        self.tree.add_command(link_group)
         self.tree.add_command(unlink_command)
-        self.tree.add_command(minecraft_command)
+        self.tree.add_command(accounts_command)
         await self.tree.sync()
 
     async def on_ready(self):
@@ -62,107 +83,143 @@ class LinkBot(discord.Client):
             member_ids = [member.id async for member in guild.fetch_members(limit=None)]
             removed = self.store.prune(guild.id, member_ids)
             if removed:
-                log(f"Removed {removed} link(s) of former members of {guild.name}.")
+                log(f"Removed links of {removed} former member(s) of {guild.name}.")
 
     async def on_member_remove(self, member):
         if self.store.unlink(member.guild.id, member.id):
-            log(f"Removed link of {member.id} (left {member.guild.name}).")
+            log(f"Removed links of {member.id} (left {member.guild.name}).")
 
     async def on_guild_remove(self, guild):
         removed = self.store.forget_guild(guild.id)
         log(f"Removed {removed} link(s) for {guild.name} (bot removed).")
 
 
-@app_commands.command(name="link", description="Link your Minecraft (Java) account")
-@app_commands.describe(username="Your Minecraft username")
-@app_commands.guild_only()
-async def link_command(interaction: discord.Interaction, username: str):
-    if not links.valid_username(username):
-        await interaction.response.send_message(
-            "That isn't a valid Minecraft username (3–16 letters, numbers or _).",
-            ephemeral=True,
+async def save_link(interaction, game, profile, shown_name):
+    try:
+        interaction.client.store.link(
+            interaction.guild_id, interaction.user.id, game, profile["id"], profile["name"]
         )
+    except links.AlreadyLinked:
+        await reply(
+            interaction,
+            f"**{shown_name}** is already linked to another member of this server.",
+        )
+        return
+
+    await reply(
+        interaction,
+        f"Linked your {links.GAMES[game]} account **{shown_name}**. "
+        "Use `/unlink` to remove it. Your links are deleted automatically "
+        "if you leave the server.",
+    )
+
+
+link_group = app_commands.Group(
+    name="link", description="Link a game account", guild_only=True
+)
+
+
+@link_group.command(name="brawlstars", description="Link your Brawl Stars account")
+@app_commands.describe(tag="Your player tag, e.g. #2PP (Profile → under your name)")
+async def link_brawl_stars(interaction: discord.Interaction, tag: str):
+    if links.normalize_tag(tag) is None:
+        await reply(interaction, "That isn't a valid Brawl Stars player tag (e.g. `#2PP`).")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        profile = await asyncio.to_thread(
+            links.lookup_brawl_stars, tag, BRAWL_STARS_API_KEY
+        )
+    except links.LookupUnavailable as error:
+        log(f"Brawl Stars lookup failed: {error}")
+        await reply(interaction, "Couldn't reach the Brawl Stars API right now, please try again later.")
+        return
+
+    if profile is None:
+        await reply(interaction, f"No Brawl Stars player with tag **{esc(tag)}** exists.")
+        return
+
+    shown = f"{esc(profile['name'])} ({profile['id']})" if profile["name"] else profile["id"]
+    await save_link(interaction, links.BRAWL_STARS, profile, shown)
+
+
+@link_group.command(name="minecraft", description="Link your Minecraft (Java) account")
+@app_commands.describe(username="Your Minecraft username")
+async def link_minecraft(interaction: discord.Interaction, username: str):
+    if not links.valid_username(username):
+        await reply(interaction, "That isn't a valid Minecraft username (3–16 letters, numbers or _).")
         return
 
     await interaction.response.defer(ephemeral=True)
 
     try:
         profile = await asyncio.to_thread(links.lookup_minecraft, username)
-    except links.MojangUnavailable as error:
+    except links.LookupUnavailable as error:
         log(f"Mojang lookup failed: {error}")
-        await interaction.followup.send(
-            "Couldn't reach Mojang right now, please try again later.",
-            ephemeral=True,
-        )
+        await reply(interaction, "Couldn't reach Mojang right now, please try again later.")
         return
 
     if profile is None:
-        await interaction.followup.send(
-            f"No Minecraft account named **{discord.utils.escape_markdown(username)}** exists.",
-            ephemeral=True,
-        )
+        await reply(interaction, f"No Minecraft account named **{esc(username)}** exists.")
         return
 
-    store = interaction.client.store
-
-    try:
-        store.link(interaction.guild_id, interaction.user.id, profile["uuid"], profile["name"])
-    except links.AlreadyLinked:
-        await interaction.followup.send(
-            f"**{discord.utils.escape_markdown(profile['name'])}** is already linked "
-            "to another member of this server.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.followup.send(
-        f"Linked to Minecraft account **{discord.utils.escape_markdown(profile['name'])}**. "
-        "Use `/unlink` to remove it. Your link is deleted automatically if you leave the server.",
-        ephemeral=True,
-    )
+    await save_link(interaction, links.MINECRAFT, profile, esc(profile["name"]))
 
 
-@app_commands.command(name="unlink", description="Unlink your Minecraft account")
+@app_commands.command(name="unlink", description="Unlink one of your game accounts")
+@app_commands.describe(game="Which account to unlink")
+@app_commands.choices(game=GAME_CHOICES)
 @app_commands.guild_only()
-async def unlink_command(interaction: discord.Interaction):
-    removed = interaction.client.store.unlink(interaction.guild_id, interaction.user.id)
+async def unlink_command(interaction: discord.Interaction, game: app_commands.Choice[str]):
+    removed = interaction.client.store.unlink(
+        interaction.guild_id, interaction.user.id, game.value
+    )
 
-    await interaction.response.send_message(
-        "Your Minecraft account has been unlinked." if removed
-        else "You don't have a linked Minecraft account.",
-        ephemeral=True,
+    await reply(
+        interaction,
+        f"Your {game.name} account has been unlinked." if removed
+        else f"You don't have a linked {game.name} account.",
     )
 
 
-@app_commands.command(name="minecraft", description="Show a member's linked Minecraft account")
+@app_commands.command(name="accounts", description="Show a member's linked game accounts")
 @app_commands.describe(member="Member to look up (defaults to you)")
 @app_commands.guild_only()
-async def minecraft_command(interaction: discord.Interaction, member: discord.Member = None):
+async def accounts_command(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    profile = interaction.client.store.get(interaction.guild_id, member.id)
+    accounts = interaction.client.store.get(interaction.guild_id, member.id)
 
-    if profile is None:
-        await interaction.response.send_message(
-            f"{member.mention} hasn't linked a Minecraft account.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+    if not accounts:
+        await reply(interaction, f"{member.mention} hasn't linked any game accounts.")
         return
 
     embed = discord.Embed(
-        title=profile["name"],
-        url=f"https://namemc.com/profile/{profile['uuid']}",
-        description=f"Minecraft account of {member.mention}",
-        color=0x5B8731,
+        title=f"{member.display_name}'s accounts",
+        color=0xF7C948,
     )
-    embed.set_thumbnail(url=f"https://mc-heads.net/avatar/{profile['uuid']}")
-    embed.set_footer(text=f"UUID {profile['uuid']}")
+    embed.set_thumbnail(url=member.display_avatar.url)
 
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    brawl = accounts.get(links.BRAWL_STARS)
+    if brawl:
+        tag = brawl["id"].lstrip("#")
+        name = f"{esc(brawl['name'])} " if brawl["name"] else ""
+        embed.add_field(
+            name="⭐ Brawl Stars",
+            value=f"[{name}#{tag}](https://brawlify.com/stats/profile/{tag})",
+            inline=False,
+        )
+
+    minecraft = accounts.get(links.MINECRAFT)
+    if minecraft:
+        embed.add_field(
+            name="⛏️ Minecraft",
+            value=f"[{esc(minecraft['name'])}](https://namemc.com/profile/{minecraft['id']})",
+            inline=False,
+        )
+
+    await reply(interaction, None, embed=embed)
 
 
 def main():
@@ -170,6 +227,9 @@ def main():
 
     if not token:
         raise SystemExit("DISCORD_BOT_TOKEN is not set.")
+
+    if not BRAWL_STARS_API_KEY:
+        log("BRAWL_STARS_API_KEY not set: Brawl Stars tags won't be verified.")
 
     store = links.LinkStore(DB_FILE)
 
