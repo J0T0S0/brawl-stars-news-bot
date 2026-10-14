@@ -1,8 +1,13 @@
 name: Brawl Stars News Bot
 
+# GitHub's scheduled workflows are heavily delayed (often hours apart), so a
+# cron alone can't poll every few minutes. Instead each run stays alive for
+# ~5h40m and polls in a loop (links every minute, news every 5 minutes), then
+# starts its own successor. The cron below is only a safety net that restarts
+# the chain if it ever breaks.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 */2 * * *"
 
   # Re-run immediately whenever the bot or this workflow changes.
   push:
@@ -18,11 +23,13 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
-# Never run two instances at once (avoids duplicate posts and push races).
+# One instance at a time (no duplicate posts / push races). A code push takes
+# over immediately; scheduled and manual runs queue behind the current one.
 concurrency:
   group: brawl-stars-news-bot
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   test:
@@ -39,7 +46,7 @@ jobs:
   check-news:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
 
     steps:
       - name: Checkout repository
@@ -50,6 +57,9 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Remember start time
+        run: echo "STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Run Brawl Stars news bot
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -58,9 +68,11 @@ jobs:
           BRAWLSTARS_API_KEY: ${{ secrets.BRAWLSTARS_API_KEY }}
           DISCORD_GUILD_ID: ${{ vars.DISCORD_GUILD_ID }}
           LINK_CHANNEL_ID: ${{ vars.LINK_CHANNEL_ID }}
+          RUN_MINUTES: "340"
+          PERSIST_STATE: "1"
         run: python bot.py
 
-      # Runs even if one source failed, so already-sent posts are persisted.
+      # The bot already pushes state after every cycle; this is a last resort.
       - name: Save state
         if: always()
         run: |
@@ -86,3 +98,18 @@ jobs:
 
           echo "::error::Could not push state.json"
           exit 1
+
+      # Hand over to the next run. It queues behind this one (same concurrency
+      # group) and starts the moment this job ends. If this run died within
+      # 10 minutes, wait first so a crash can't cause a tight restart loop.
+      - name: Start next run
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          elapsed=$(( $(date +%s) - STARTED_AT ))
+          if [ "$elapsed" -lt 600 ]; then
+            echo "Run ended after ${elapsed}s, backing off before restarting."
+            sleep $(( 600 - elapsed ))
+          fi
+          gh workflow run news.yml --ref main

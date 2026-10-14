@@ -104,6 +104,50 @@ class FallbackTests(unittest.TestCase):
             bot.main()  # must not raise SystemExit
 
 
+class LoopTests(unittest.TestCase):
+
+    def run_loop(self, minutes):
+        calls = []
+        now = [0.0]
+
+        def fake_run_sources(state, webhook, names, **options):
+            calls.append((now[0], tuple(names), options.get("links", {}).get("purge")))
+            return 0
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with mock.patch.object(bot, "run_sources", fake_run_sources),                 mock.patch.object(bot, "persist_state"):
+            bot.run_loop({}, "w", minutes * 60, clock=lambda: now[0], sleep=sleep)
+
+        return calls
+
+    def test_cadence(self):
+        calls = self.run_loop(12)
+        links_runs = [c for c in calls if "links" in c[1]]
+        news_runs = [c for c in calls if "news" in c[1]]
+
+        self.assertEqual(len(links_runs), 12)                # every minute
+        self.assertEqual([c[0] for c in news_runs], [0, 300, 600])
+        self.assertEqual([c[0] for c in links_runs if c[2]], [0, 600])  # purge
+
+    def test_stop_flag_ends_loop_early(self):
+        calls = []
+
+        def fake_run_sources(state, webhook, names, **options):
+            calls.append(names)
+            bot.STOP = True
+            return 0
+
+        try:
+            with mock.patch.object(bot, "run_sources", fake_run_sources),                     mock.patch.object(bot, "persist_state"):
+                bot.run_loop({}, "w", 3600, clock=lambda: 0.0, sleep=lambda s: None)
+        finally:
+            bot.STOP = False
+
+        self.assertEqual(len(calls), 1)
+
+
 class StateTests(unittest.TestCase):
 
     def setUp(self):

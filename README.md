@@ -20,7 +20,7 @@ The scheduled run always uses the latest code on `main`, so no manual re-run is 
 ## Account linking (optional)
 
 Members link their Brawl Stars account by **posting their tag in one dedicated channel** (e.g. `#2PP0`).
-The bot, on its 5-minute run, validates it with the Brawl Stars API and reacts ✅ (linked) or ❌ (unknown tag / limit of 3 reached).
+The bot (polling every minute), validates it with the Brawl Stars API and reacts ✅ (linked) or ❌ (unknown tag / limit of 3 reached).
 
 Chat commands in that channel: `!profile [@member]` and `!stats [@member]` (answered with a reply).
 
@@ -38,5 +38,17 @@ personal data is written to this repository (`state.json` only stores the id of 
 3. Repository secrets: `DISCORD_BOT_TOKEN`, `BRAWLSTARS_API_KEY`.
    Repository variables: `DISCORD_GUILD_ID`, `LINK_CHANNEL_ID`.
 
-Replies can take up to ~5-10 minutes (GitHub's cron granularity). Tags are not ownership-verified
+Reactions and replies arrive within about a minute (see below). Tags are not ownership-verified
 (Supercell offers no way to prove an account is yours).
+
+## How it runs
+
+GitHub's `schedule` trigger is unreliable (runs end up hours apart), so it can't be used to poll every few minutes.
+Instead each workflow run stays alive for ~5h40m and loops: account linking every minute, news and YouTube every 5 minutes,
+departed-member cleanup every 10 minutes. Just before it ends it starts its own successor, which queues behind it
+and takes over (a short gap of about a minute between runs is normal). The 2-hourly cron is only a safety net that
+restarts the chain if it breaks, and pushing code to `main` replaces the running instance immediately.
+State is committed after every cycle, so a cancelled run never loses progress.
+
+To stop the bot, disable the workflow in the Actions tab (and cancel the running job).
+Free for public repositories; on a private repository this would use all of the free Actions minutes.

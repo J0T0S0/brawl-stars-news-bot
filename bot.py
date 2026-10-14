@@ -1,5 +1,7 @@
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 import html
@@ -27,6 +29,12 @@ YOUTUBE_FEED_URLS = (
     "https://www.youtube.com/feeds/videos.xml?playlist_id=UU"
     + YOUTUBE_CHANNEL_ID[2:],
 )
+
+RUN_MINUTES = float(os.environ.get("RUN_MINUTES") or 0)
+LINK_INTERVAL = 60
+NEWS_INTERVAL = 300
+PURGE_INTERVAL = 600
+STOP = False
 
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
@@ -509,7 +517,7 @@ def fetch_player(tag):
         raise links.Unavailable(f"Brawl Stars API unreachable: {error}")
 
 
-def process_links(state, _webhook_url):
+def process_links(state, _webhook_url, purge=True):
     channel = os.environ.get("LINK_CHANNEL_ID", "").strip()
 
     if not channel:
@@ -538,7 +546,7 @@ def process_links(state, _webhook_url):
     )
 
     try:
-        stats = scanner.run(state.get("link_cursor"), save_cursor)
+        stats = scanner.run(state.get("link_cursor"), save_cursor, purge=purge)
     except links.Unavailable as error:
         raise SourceUnavailable(str(error))
 
@@ -672,28 +680,128 @@ def main():
         )
 
     state = load_state()
+
+    if RUN_MINUTES <= 0:
+        # Single pass (local use / tests).
+        if run_sources(state, webhook_url, SOURCES):
+            sys.exit(1)
+        return
+
+    def request_stop(*_):
+        global STOP
+        STOP = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    try:
+        failed = run_loop(state, webhook_url, RUN_MINUTES * 60)
+    finally:
+        persist_state()
+
+    if failed:
+        sys.exit(1)
+
+
+SOURCES = ("news", "youtube", "links")
+
+# Resolved by name at call time so each processor can be swapped out in tests.
+PROCESSORS = {
+    "news": ("News", "process_news"),
+    "youtube": ("YouTube", "process_youtube"),
+    "links": ("Links", "process_links"),
+}
+
+
+def run_sources(state, webhook_url, names, **options):
+    """Runs the named sources, each isolated. Returns the number of failures."""
+
     failures = 0
 
-    # Each source is isolated: one failing never blocks the other.
-    sources = (
-        ("News", process_news),
-        ("YouTube", process_youtube),
-        ("Links", process_links),
-    )
+    for key in names:
+        name, function = PROCESSORS[key]
+        processor = globals()[function]
 
-    for name, processor in sources:
         try:
-            handled = processor(state, webhook_url)
+            handled = processor(state, webhook_url, **options.get(key, {}))
             log(f"{name}: {handled} item(s) handled.")
         except SourceUnavailable as error:
-            # Transient upstream problem: nothing was lost, retry in 5 min.
+            # Transient upstream problem: nothing was lost, retried next cycle.
             log(f"::warning title={name} unavailable::{error}")
         except Exception as error:
             failures += 1
             log(f"::error title={name} check failed::{type(error).__name__}: {error}")
 
-    if failures:
-        sys.exit(1)
+    return failures
+
+
+def persist_state():
+    """Commits and pushes state.json (CI only), so progress survives a
+    cancelled or timed-out job."""
+
+    if os.environ.get("PERSIST_STATE") != "1":
+        return
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=120
+        )
+
+    git("config", "user.name", "Brawl Stars News Bot")
+    git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+    git("add", STATE_FILE)
+
+    if git("diff", "--cached", "--quiet").returncode == 0:
+        return
+
+    git("commit", "-m", "Update news state [skip ci]")
+
+    for _ in range(3):
+        if git("push").returncode == 0:
+            return
+
+        git("pull", "--rebase", "-X", "theirs")
+
+    log("::warning::Could not push state.json; will retry next cycle.")
+
+
+def run_loop(
+    state,
+    webhook_url,
+    seconds,
+    clock=time.monotonic,
+    sleep=time.sleep,
+):
+    """Polls for `seconds`: links every minute, news/YouTube every 5 minutes,
+    member purge every 10 minutes. Returns True if the last cycle failed."""
+
+    deadline = clock() + seconds
+    next_news = next_purge = clock()
+    failed = False
+
+    while not STOP and clock() < deadline:
+        started = clock()
+        names = []
+        options = {"links": {"purge": started >= next_purge}}
+
+        if started >= next_news:
+            names += ["news", "youtube"]
+            next_news = started + NEWS_INTERVAL
+
+        if started >= next_purge:
+            next_purge = started + PURGE_INTERVAL
+
+        names.append("links")
+        failed = bool(run_sources(state, webhook_url, names, **options))
+        persist_state()
+
+        # Interruptible wait until the next tick.
+        wake = started + LINK_INTERVAL
+
+        while not STOP and clock() < min(wake, deadline):
+            sleep(min(1, max(0, wake - clock())))
+
+    return failed
 
 
 if __name__ == "__main__":

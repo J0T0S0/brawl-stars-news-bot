@@ -287,7 +287,7 @@ class LinkScanner:
 
     # -- main -------------------------------------------------
 
-    def run(self, cursor, save_cursor):
+    def run(self, cursor, save_cursor, purge=True):
         """Processes new messages. `cursor` is the last handled message id.
 
         Returns a dict of counters.
@@ -296,7 +296,9 @@ class LinkScanner:
         stats = {"linked": 0, "rejected": 0, "commands": 0, "purged": 0}
 
         messages = self.history()
-        messages, stats["purged"] = self.purge_departed(messages)
+
+        if purge:
+            messages, stats["purged"] = self.purge_departed(messages)
 
         linked = self.linked_tags(messages)
         last = int(cursor or 0)
