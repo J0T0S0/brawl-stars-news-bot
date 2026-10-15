@@ -117,28 +117,27 @@ def bot_replies(d, channel=None):
 
 class ParsingTests(unittest.TestCase):
 
-    def test_extract_tags(self):
-        self.assertEqual(links.extract_tags("my tag is #2pp0!"), ["2PP0"])
-        self.assertEqual(links.extract_tags("2PPO"), ["2PP0"])
-        self.assertEqual(links.extract_tags("#2PP0 and #8Q2L"), ["2PP0", "8Q2L"])
-        self.assertEqual(links.extract_tags("#2PP0 #2pp0"), ["2PP0"])
-        self.assertEqual(links.extract_tags("hello everyone"), [])
-        self.assertEqual(links.extract_tags("#ABC"), [])       # invalid characters
-        self.assertEqual(links.extract_tags("lol this is cool"), [])
-        self.assertEqual(len(links.extract_tags("#PPP #YYY #LLL #QQQ #GGG")), 3)
+    def test_extract_tag(self):
+        et = links.extract_tag
+        self.assertEqual(et("my tag is #2pp0!"), "2PP0")
+        self.assertEqual(et("2PPO"), "2PP0")
+        self.assertEqual(et("#2PP0 and #8Q2L"), "2PP0")        # first one counts
+        self.assertEqual(et("#hello then #8Q2L"), "8Q2L")      # first *valid* one
+        self.assertIsNone(et("hello everyone"))
+        self.assertIsNone(et("#ABC"))                          # invalid characters
+        self.assertIsNone(et("lol this is cool"))
+        self.assertIsNone(et("testidfake"))
+        self.assertIsNone(et(""))
 
     def test_commands(self):
         pc = links.parse_command
-        self.assertEqual(pc("!profile"), ("profile", None, None))
-        self.assertEqual(pc("!STATS <@123>"), ("stats", ("id", "123"), None))
-        self.assertEqual(pc("!profile <@!42>"), ("profile", ("id", "42"), None))
-        self.assertEqual(pc("!profile Alice"), ("profile", ("name", "Alice"), None))
-        self.assertEqual(pc("!profile  @alice smith "), ("profile", ("name", "alice smith"), None))
-        self.assertEqual(pc("!profile alice 2"), ("profile", ("name", "alice"), 2))
-        self.assertEqual(pc("!stats 3"), ("stats", None, 3))
-        self.assertEqual(pc("!profile <@5> 2"), ("profile", ("id", "5"), 2))
-        self.assertEqual(pc("!profile player4"), ("profile", ("name", "player4"), None))
-        self.assertEqual(pc("!help"), ("help", None, None))
+        self.assertEqual(pc("!profile"), ("profile", None))
+        self.assertEqual(pc("!STATS <@123>"), ("stats", ("id", "123")))
+        self.assertEqual(pc("!profile <@!42>"), ("profile", ("id", "42")))
+        self.assertEqual(pc("!profile Alice"), ("profile", ("name", "Alice")))
+        self.assertEqual(pc("!profile  @alice smith "), ("profile", ("name", "alice smith")))
+        self.assertEqual(pc("!profile player4"), ("profile", ("name", "player4")))
+        self.assertEqual(pc("!help"), ("help", None))
         self.assertIsNone(pc("profile"))
         self.assertIsNone(pc("!profilex"))
 
@@ -174,12 +173,54 @@ class LinkingTests(unittest.TestCase):
         run(make(d))  # cursor lost
         self.assertEqual(list(d.reactions.values()), [[links.OK]])
 
-    def test_account_limit(self):
+    def test_one_account_per_member_new_tag_replaces_old(self):
+        d = FakeDiscord({"1", "2"})
+        first = d.post("1", "#2PP0")
+        scanner = make(d)
+        _, cursors = run(scanner)
+        second = d.post("1", "#8Q2L")
+        stats, cursors = run(scanner, cursors)
+
+        self.assertEqual(stats["linked"], 1)
+        ids = {m["id"] for m in d.in_channel(LINK)}
+        self.assertNotIn(first["id"], ids)                 # old link removed
+        self.assertIn(second["id"], ids)
+        self.assertEqual(d.reactions[second["id"]], [links.OK])
+
+        d.post("2", "!profile alice")
+        run(scanner, cursors)
+        self.assertEqual(bot_replies(d)[-1]["embeds"][0]["description"], "`#8Q2L`")
+
+    def test_invalid_new_tag_keeps_the_old_link(self):
         d = FakeDiscord({"1"})
-        for tag in ("2PP0", "8Q2L", "9YY", "PPP"):
-            d.post("1", f"#{tag}")
-        run(make(d))
-        self.assertEqual(d.reactions[d.messages[-1]["id"]], [links.BAD])
+        first = d.post("1", "#2PP0")
+        scanner = make(d)
+        _, cursors = run(scanner)
+        bad = d.post("1", "#QQQQ")
+        run(scanner, cursors)
+        self.assertIn(first["id"], {m["id"] for m in d.in_channel(LINK)})
+        self.assertEqual(d.reactions[bad["id"]], [links.BAD])
+
+    def test_only_the_first_tag_in_a_message_counts(self):
+        d = FakeDiscord({"1", "2"})
+        d.post("1", "#QQQQ and #2PP0")                     # first tag unknown
+        stats, _ = run(make(d))
+        self.assertEqual((stats["linked"], stats["rejected"]), (0, 1))
+
+    def test_relinking_the_same_tag_does_not_hit_the_api(self):
+        d = FakeDiscord({"1"})
+        d.post("1", "#2PP0")
+        calls = []
+
+        def fetch(tag):
+            calls.append(tag)
+            return {**PLAYER, "tag": "#" + tag}
+
+        scanner = links.LinkScanner(d, fetch, LINK, "guild", pause=0)
+        _, cursors = run(scanner)
+        d.post("1", "#2PP0")
+        run(scanner, cursors)
+        self.assertEqual(calls, ["2PP0"])
 
     def test_api_outage_keeps_message_for_retry(self):
         d = FakeDiscord({"1"})
@@ -272,7 +313,7 @@ class CommandFeatureTests(unittest.TestCase):
 
     def setUp(self):
         self.d = FakeDiscord({"1", "2"})
-        self.d.post("1", "#2PP0 #8Q2L")
+        self.d.post("1", "#2PP0")
         self.scanner = make(self.d, command_channel=CMD)
         _, self.cursors = run(self.scanner)
 
@@ -285,15 +326,7 @@ class CommandFeatureTests(unittest.TestCase):
         reply = self.ask("!help")
         self.assertIn("!profile", reply["content"])
         self.assertIn(f"<#{LINK}>", reply["content"])
-
-    def test_pick_second_account(self):
-        first = self.ask("!profile alice")
-        second = self.ask("!profile alice 2")
-        self.assertEqual(first["embeds"][0]["description"], "`#2PP0`")
-        self.assertEqual(second["embeds"][0]["description"], "`#8Q2L`")
-
-    def test_account_index_out_of_range(self):
-        self.assertIn("only 2 linked accounts", self.ask("!profile alice 3")["content"])
+        self.assertNotIn("1-3", reply["content"])
 
     def test_command_flood_is_capped(self):
         for _ in range(6):
@@ -416,6 +449,25 @@ class CleanupTests(unittest.TestCase):
         off.cleanup = False
         stats, _ = run(off, self.cursors)
         self.assertEqual(stats["cleaned"], 0)
+
+
+class LegacyLinksTests(unittest.TestCase):
+
+    def test_several_marked_messages_newest_wins_and_old_ones_are_cleaned(self):
+        d = FakeDiscord({"1"})
+        old = d.post("1", "#2PP0")
+        new = d.post("1", "#8Q2L")
+        d.reactions[old["id"]] = [links.OK]
+        d.reactions[new["id"]] = [links.OK]
+        scanner = make(d, command_channel=CMD)
+        cursors = {"link": new["id"]}
+
+        d.post("1", "!profile", channel=CMD)
+        stats, _ = run(scanner, cursors)
+
+        self.assertEqual(bot_replies(d, CMD)[-1]["embeds"][0]["description"], "`#8Q2L`")
+        self.assertEqual({m["id"] for m in d.in_channel(LINK)}, {new["id"]})
+        self.assertEqual(stats["cleaned"], 1)
 
 
 class ContentIntentTests(unittest.TestCase):

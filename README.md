@@ -30,18 +30,18 @@ net that restarts the chain if it breaks.
 ## Account linking
 
 Members post their player tag (e.g. `#2PP0`) in the **link channel**. The bot (polling every minute) checks it with the
-Brawl Stars API and reacts ✅ (linked) or ❌ (not a valid tag, unknown player, or already 3 accounts).
+Brawl Stars API and reacts ✅ (linked) or ❌ (not a valid tag or unknown player). Each member has **one account**: posting a new valid tag replaces the previous one, and a message with several tags uses the first.
 
 Chat commands, written in a separate **command channel** (`COMMAND_CHANNEL_ID`; if unset they are read in the link channel):
 
 | Command | Shows |
 | --- | --- |
-| `!profile [name] [1-3]` | trophies, level, club, wins |
-| `!stats [name] [1-3]` | top 15 brawlers |
+| `!profile [name]` | trophies, level, club, wins |
+| `!stats [name]` | top 15 brawlers |
 | `!help` | usage |
 
 Use the member's Discord name (`!profile alice`): no @ needed, so nobody gets a notification (a real @mention also
-works). Leave the name out or write `me` for yourself. The number picks one of a member's (up to 3) linked accounts.
+works). Leave the name out or write `me` for yourself.
 Replies never ping anyone, and each member can run at most 3 commands per minute.
 
 **Tidiness.** With a command channel configured, the link channel is tags-only: ❌ messages, chatter and edited

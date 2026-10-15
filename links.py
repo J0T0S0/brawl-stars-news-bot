@@ -23,7 +23,6 @@ import urllib.parse
 OK = "✅"
 BAD = "❌"
 
-MAX_ACCOUNTS = 3
 MAX_HISTORY_PAGES = 10            # 1000 messages
 UNKNOWN_MEMBER_CODES = (10007, 10013)
 
@@ -54,30 +53,29 @@ def normalize_tag(text):
     return tag if _TAG.match(tag) else None
 
 
-def extract_tags(content):
-    """Tags in a message: '#TAG' anywhere, or the whole message being a tag."""
+def extract_tag(content):
+    """The tag a message is offering: the first valid '#TAG' in it, or the
+    whole message when it is a single bare tag. None if there isn't one."""
 
     candidates = _HASH_TAG.findall(content or "")
 
     if not candidates and content and len(content.split()) == 1:
         candidates = [content]
 
-    tags = []
-
     for candidate in candidates:
         tag = normalize_tag(candidate)
 
-        if tag and tag not in tags:
-            tags.append(tag)
+        if tag:
+            return tag
 
-    return tags[:MAX_ACCOUNTS]
+    return None
 
 
 def parse_command(content):
-    """-> (kind, target, index) or None.
+    """-> (kind, target) or None.
 
     target is None (yourself), ("id", discord_id) for an @mention, or
-    ("name", text). index (1-3) picks one of a member's linked accounts.
+    ("name", text).
     """
 
     match = _COMMAND.match(content or "")
@@ -87,21 +85,17 @@ def parse_command(content):
 
     kind = match.group(1).lower()
     tokens = match.group(2).split()
-    index = None
-
-    if tokens and tokens[-1] in ("1", "2", "3"):
-        index = int(tokens.pop())
 
     if not tokens:
-        return kind, None, index
+        return kind, None
 
     mention = _MENTION.match(tokens[0])
 
     if mention:
-        return kind, ("id", mention.group(1)), index
+        return kind, ("id", mention.group(1))
 
     # A plain name needs no @-mention, so nobody gets a notification.
-    return kind, ("name", " ".join(tokens).lstrip("@").strip()[:64]), index
+    return kind, ("name", " ".join(tokens).lstrip("@").strip()[:64])
 
 
 def snowflake_ms(message_id):
@@ -194,6 +188,8 @@ class LinkScanner:
         self._left = {}
         self._names = {}
         self._command_counts = {}
+        self._link_messages = []
+        self._live_ids = {}
         self.warnings = set()
 
     # -- Discord helpers --------------------------------------
@@ -288,14 +284,16 @@ class LinkScanner:
         ]
 
     def linked_tags(self, messages):
-        """{discord_id: [tags]} from messages carrying the bot's check mark.
+        """{discord_id: tag} from messages carrying the bot's check mark.
 
-        Edited messages are ignored: an edit could swap in a tag that was never
-        validated, so editing effectively unlinks.
+        A member has one account: if several of their messages are marked, the
+        newest wins. Edited messages are ignored (an edit could swap in a tag
+        that was never validated), so editing effectively unlinks.
         """
 
         linked = {}
         self._names = {}
+        self._live_ids = {}
 
         for message in reversed(messages):  # oldest first
             if message["author"].get("bot") or message.get("edited_timestamp"):
@@ -304,13 +302,15 @@ class LinkScanner:
             if not self._bot_reacted(message, OK):
                 continue
 
-            author = message["author"]
-            tags = linked.setdefault(author["id"], [])
-            self._remember_name(author)
+            tag = extract_tag(message.get("content"))
 
-            for tag in extract_tags(message.get("content")):
-                if tag not in tags and len(tags) < MAX_ACCOUNTS:
-                    tags.append(tag)
+            if not tag:
+                continue
+
+            author = message["author"]
+            linked[author["id"]] = tag
+            self._live_ids[author["id"]] = message["id"]
+            self._remember_name(author)
 
         return linked
 
@@ -378,7 +378,7 @@ class LinkScanner:
         for message in messages:
             message_id = int(message["id"])
 
-            live_link = self._bot_reacted(message, OK) and not message.get("edited_timestamp")
+            live_link = message["id"] in self._live_ids.values()
             rejected = self._bot_reacted(message, BAD)
 
             if (
@@ -418,6 +418,7 @@ class LinkScanner:
             channels, stats["purged"] = self.purge_departed(channels)
 
         linked = self.linked_tags(channels[self.channel])
+        self._link_messages = channels[self.channel]
 
         if purge and self.cleanup:
             stats["cleaned"] = self.clean_link_channel(
@@ -468,9 +469,9 @@ class LinkScanner:
         if self._bot_reacted(message, OK) or self._bot_reacted(message, BAD):
             return  # already handled (cursor was lost)
 
-        tags = extract_tags(content)
+        tag = extract_tag(content)
 
-        if not tags:
+        if not tag:
             if content.strip():
                 # Not a valid tag (e.g. "testidfake"): mark it so people see why.
                 self.react(channel, message, BAD)
@@ -482,30 +483,29 @@ class LinkScanner:
                 stats["blind"] += 1
             return
 
-        mine = linked.setdefault(author, [])
-        accepted = 0
-
-        for tag in tags:
-            if tag in mine:
-                accepted += 1
-                continue
-
-            if len(mine) >= MAX_ACCOUNTS:
-                break
-
+        if linked.get(author) != tag:
             try:
                 self.fetch_player(tag)
             except NotFound:
-                continue
+                self.react(channel, message, BAD)
+                stats["rejected"] += 1
+                return
 
-            mine.append(tag)
-            accepted += 1
+        # One account per member: a new link replaces the previous one.
+        for old in list(self._link_messages):
+            if (
+                old["id"] != message["id"]
+                and old["author"]["id"] == author
+                and self._bot_reacted(old, OK)
+            ):
+                self.delete(channel, old["id"])
+                self._link_messages.remove(old)
 
-        if accepted:
-            self._remember_name(message["author"])
-
-        self.react(channel, message, OK if accepted else BAD)
-        stats["linked" if accepted else "rejected"] += 1
+        linked[author] = tag
+        self._live_ids[author] = message["id"]
+        self._remember_name(message["author"])
+        self.react(channel, message, OK)
+        stats["linked"] += 1
 
     def display_name(self, user_id):
         return (self._names.get(user_id) or [user_id])[0]
@@ -532,20 +532,18 @@ class LinkScanner:
         return []
 
     def help_text(self):
-        where = f"<#{self.channel}>"
         return (
             "**Brawl Stars account linking**\n"
-            f"Post your player tag (e.g. `#2PP0`) in {where} to link it "
-            f"(up to {MAX_ACCOUNTS} accounts). Delete the message to unlink.\n\n"
-            "`!profile [name] [1-3]` shows a linked player's profile\n"
-            "`!stats [name] [1-3]` shows their top brawlers\n"
+            f"Post your player tag (e.g. `#2PP0`) in <#{self.channel}> to link it. "
+            "Posting a new tag replaces the old one; delete the message to unlink.\n\n"
+            "`!profile [name]` shows a linked player's profile\n"
+            "`!stats [name]` shows their top brawlers\n"
             "Use the member's Discord name, no @ needed (nobody gets pinged). "
-            "Leave the name out for yourself; the number picks one of "
-            "their linked accounts."
+            "Leave the name out for yourself."
         )
 
     def _command(self, channel, message, command, linked):
-        kind, argument, index = command
+        kind, argument = command
 
         if kind == "help":
             self.reply(channel, message, self.help_text())
@@ -572,9 +570,9 @@ class LinkScanner:
 
             target = matches[0]
 
-        tags = linked.get(target)
+        tag = linked.get(target)
 
-        if not tags:
+        if not tag:
             # Never name the target: a reply naming someone could outlive them
             # if they leave, and they would have no messages left to trigger a purge.
             who = "You haven't" if target == message["author"]["id"] else "That member hasn't"
@@ -583,16 +581,8 @@ class LinkScanner:
                        f"Post your tag (e.g. `#2PP0`) in <#{self.channel}>.")
             return
 
-        position = (index or 1) - 1
-
-        if position >= len(tags):
-            self.reply(channel, message,
-                       f"That member has only {len(tags)} linked account"
-                       f"{'s' if len(tags) != 1 else ''}.")
-            return
-
         try:
-            player = self.fetch_player(tags[position])
+            player = self.fetch_player(tag)
         except NotFound:
             self.reply(channel, message, "That linked tag no longer exists.")
             return
