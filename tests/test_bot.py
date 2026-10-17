@@ -148,36 +148,27 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
-class HealthTests(unittest.TestCase):
+class NoDeveloperNoiseTests(unittest.TestCase):
 
-    def test_alert_once_after_repeated_failures_then_recovery(self):
-        sent = []
-        streaks, alerted = {}, set()
+    def test_failing_sources_never_post_to_discord(self):
+        posted = []
 
-        with mock.patch.object(bot, "send_alert",
-                               lambda webhook, title, *a: sent.append(title)):
-            for _ in range(bot.ALERT_AFTER + 3):
-                bot.track_health("w", streaks, {"links": "RuntimeError: boom"}, alerted)
+        def boom(*args, **kwargs):
+            raise RuntimeError("source is broken")
 
-            self.assertEqual(len(sent), 1)
-            self.assertIn("Links has been failing", sent[0])
+        with mock.patch.object(bot, "process_news", boom), \
+                mock.patch.object(bot, "process_youtube",
+                                  side_effect=bot.SourceUnavailable("404")), \
+                mock.patch.object(bot, "process_links", boom), \
+                mock.patch.object(bot, "post_embeds",
+                                  lambda *a, **k: posted.append(a)), \
+                mock.patch.object(bot, "send_discord",
+                                  lambda *a, **k: posted.append(a)):
+            for _ in range(20):
+                failures = bot.run_sources({}, "w", bot.SOURCES)
 
-            bot.track_health("w", streaks, {"links": None}, alerted)
-            bot.track_health("w", streaks, {"links": None}, alerted)
-            self.assertEqual(len(sent), 2)
-            self.assertIn("working again", sent[1])
-
-    def test_short_blips_do_not_alert(self):
-        sent = []
-        streaks, alerted = {}, set()
-
-        with mock.patch.object(bot, "send_alert", lambda *a: sent.append(a)):
-            for _ in range(10):
-                bot.track_health("w", streaks, {"news": "boom"}, alerted)
-                bot.track_health("w", streaks, {"news": "boom"}, alerted)
-                bot.track_health("w", streaks, {"news": None}, alerted)
-
-        self.assertEqual(sent, [])
+        self.assertEqual(failures, 2)   # logged for the Actions run, nothing else
+        self.assertEqual(posted, [])
 
 
 class StateTests(unittest.TestCase):

@@ -23,7 +23,7 @@ net that restarts the chain if it breaks.
 - Pushing to `main` (bot code, tests or the workflow) cancels the running instance and starts a fresh one, so changes
   apply within a minute or two. You never need to re-run it by hand.
 - `state.json` is committed after every cycle, so a cancelled run never loses progress or repeats posts.
-- If a source fails 5 cycles in a row, the bot posts a status alert to the news webhook, and another when it recovers.
+- Problems (a broken feed, a missing permission) only appear in the Actions log as warnings or errors. The bot never posts developer information to your Discord channels.
 - To stop the bot, disable the workflow in the Actions tab and cancel the running job.
 - Free for public repositories. On a private repository this would use all of the free Actions minutes.
 
@@ -75,6 +75,6 @@ DRY_RUN=1 STATE_FILE=sim_state.json python bot.py   # prints embeds, sends nothi
 
 | File | Purpose |
 | --- | --- |
-| `bot.py` | Fetching, Discord output, polling loop, state, health alerts |
+| `bot.py` | Fetching, Discord output, polling loop, state |
 | `articles.py` | Parses Supercell articles and renders balance changes |
 | `links.py` | Account linking: channel scanning, commands, privacy cleanup |
